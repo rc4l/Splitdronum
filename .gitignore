@@ -1,0 +1,7 @@
+build/
+*.obj
+*.pdb
+*.exe
+*.ilk
+dll/ss_offsets.h   # generated from the built engine at DLL-build time
+*.log
