@@ -34,14 +34,14 @@ static std::string RepoRoot() {
 }
 
 // Build the play.ps1 invocation from the form state and run it detached.
-static void Launch(int players, const char* iwad, const char* gamePath, float scale,
+static void Launch(const char* iwad, const char* gamePath, float scale,
                    int fpsMode, int fpsCustom) {
 #ifdef _WIN32
     std::string root = RepoRoot();
     int fps = (fpsMode == 0) ? -1 : (fpsMode == 1) ? 0 : fpsCustom;   // refresh / uncapped / custom
     char num[64];
     std::string a = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"" + root + "\\play.ps1\"";
-    _snprintf(num, sizeof(num), " -Players %d", players);        a += num;
+    a += " -Players 1";   // solo start; controllers join live, so the launcher never sets a seat count
     a += std::string(" -Iwad \"") + iwad + "\"";
     _snprintf(num, sizeof(num), " -RenderScale %.2f", scale);    a += num;
     _snprintf(num, sizeof(num), " -Fps %d", fps);                a += num;
@@ -51,12 +51,12 @@ static void Launch(int players, const char* iwad, const char* gamePath, float sc
     std::vector<char> buf(a.begin(), a.end()); buf.push_back('\0');
     if (CreateProcessA(NULL, buf.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, root.c_str(), &si, &pi)) {
         CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
-        _snprintf(g_status, sizeof(g_status), "Launched %d-player session. (Close the game window to stop.)", players);
+        _snprintf(g_status, sizeof(g_status), "Launched. Press Start on a controller in-game to add a player.");
     } else {
         _snprintf(g_status, sizeof(g_status), "Could not start play.ps1 (error %lu). Is play.ps1 in the repo root?", GetLastError());
     }
 #else
-    (void)players; (void)iwad; (void)gamePath; (void)scale; (void)fpsMode; (void)fpsCustom;
+    (void)iwad; (void)gamePath; (void)scale; (void)fpsMode; (void)fpsCustom;
     _snprintf(g_status, sizeof(g_status),
               "The splitdronum runtime is Windows-only for now -- launching isn't available on this OS yet.");
 #endif
@@ -86,7 +86,6 @@ int main(int, char**) {
     ImGui_ImplOpenGL3_Init(glsl_version);
 
     // form state (defaults mirror play.ps1)
-    int   players = 2;
     char  iwad[128] = "freedoom2.wad";
     char  gamePath[512] = "";          // blank -> play.ps1 uses the sibling zandronum build
     float scale = 1.0f;
@@ -111,8 +110,6 @@ int main(int, char**) {
         ImGui::Spacing();
 
         ImGui::PushItemWidth(300);
-        ImGui::SliderInt("Players", &players, 1, 4);
-        ImGui::SameLine(); ImGui::TextDisabled("(seat 0 = kbd+mouse, 1-3 = controllers)");
         ImGui::InputText("IWAD", iwad, sizeof(iwad));
         ImGui::InputText("Game path", gamePath, sizeof(gamePath));
         ImGui::SameLine(); ImGui::TextDisabled("(blank = sibling build)");
@@ -134,8 +131,9 @@ int main(int, char**) {
         ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
 
         if (ImGui::Button("Play", ImVec2(120, 40)))
-            Launch(players, iwad, gamePath, scale, fpsMode, fpsCustom);
+            Launch(iwad, gamePath, scale, fpsMode, fpsCustom);
         ImGui::Spacing();
+        ImGui::TextDisabled("Player 1 is keyboard + mouse. Press Start on a controller in-game to add a player.");
         ImGui::TextDisabled("First launch builds the DLL + host (once). Close the game window to stop everything.");
 
         if (g_status[0]) {
