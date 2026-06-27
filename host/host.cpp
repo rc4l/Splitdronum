@@ -9,6 +9,8 @@
 // path. Co-op (a loopback server the clients join) and input routing come next.
 //
 //   host.exe <numPlayers> <full\ss_hook.dll> <full\zandronum.exe> <iwad> [gamedir]
+#include <winsock2.h>          // free-port probe (must precede windows.h to avoid the winsock1 clash)
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <timeapi.h>           // timeBeginPeriod -- 1ms timer so the present loop isn't ~64fps
 #include <dwmapi.h>            // DwmFlush -- GDI fallback path only
@@ -21,6 +23,8 @@
 #include <cstdlib>
 #include <vector>
 #include "../core/ss_layout.h"
+#include "../core/ss_join.h"    // pure controller drop-in state machine (100%-tested; host owns the glue)
+#include "../core/ss_profile.h" // pure profile list + client launch-arg builder (100%-tested)
 
 // --- inject the DLL into a freshly-launched stock client, in two phases so the engine's main thread
 //     stays suspended until the DLL's window hooks are live (no startup-window flash). Splitting
@@ -63,10 +67,14 @@ static DWORD ResumeAfterHooks(Launch& L) {
 static const int FB_MAGIC = 0x5A444C46;
 static const int IN_MAGIC = 0x5A414E49;   // 'ZANI' -- the host->client input section (matches the DLL)
 static const int KEY_RING = 64;
-static const int IN_AXES  = 136;          // ZanIN int index of the 5 controller axes (value x1000)
-static const int IN_MENU  = 160;          // ZanIN int the DLL writes back: 1 = that seat is in a menu/console
+static const int IN_AXES    = 136;        // ZanIN int index of the 5 controller axes (value x1000)
+static const int IN_MENU    = 160;        // ZanIN int the DLL writes back: 1 = that seat is in a menu/console
+static const int IN_CMDSEQ  = 164;        // bumped after writing a console command at IN_CMDTEXT (DLL runs it)
+static const int IN_CMDTEXT = 168;        // command string bytes, up to IN_CMDMAX
+static const int IN_CMDMAX  = 120;
 static volatile LONG g_mouseFreed = 0;    // 1 = release the mouse (a menu is up) so it can roam the desktop
 static float g_renderScale = 1.0f;        // client render res = monitor size * this (SS_RENDER_SCALE; <1 = faster/softer)
+static bool  g_smartScale  = true;        // scale render res down as more seats join (SS_SMARTSCALE=0 disables)
 enum { AX_Yaw = 0, AX_Pitch = 1, AX_Forward = 2, AX_Side = 3 };   // m_joy.h order
 
 // Optional per-axis look inversion (set from the environment by play.ps1). Defaults give
@@ -81,11 +89,19 @@ struct Client {
     int keyWrite = 0;
     bool alive = true;                 // dynamic drop-in: false once this seat has left (slot reusable)
     int  pad = -1;                     // XInput index driving this seat; -1 = seat 0 (keyboard+mouse)
+    char name[48] = "";                // this seat's player/profile name -- for the no-duplicate-profile check
+    HANDLE hproc = nullptr;            // SYNCHRONIZE handle to the client process -> detect quit-game/crash
 };
 static std::vector<Client> g_clients;
 static CRITICAL_SECTION    g_clientsLock;   // guards g_clients mutation (manager) vs read (render/main)
-static volatile LONG       g_joinPad = -1;  // a pad is awaiting join confirmation (its XInput index), else -1
+// Create-and-join flow state, published by the manager thread for the render thread (DrawJoinPrompt):
+static volatile LONG       g_joinPad = -1;  // controller currently in the create flow (its XInput index), else -1
+static volatile LONG       g_joinStep = 0;  // ss::JoinStep: prompt / word1 / word2 / crosshair / motion-comp
+static volatile LONG       g_joinW1 = 0, g_joinW2 = 0;          // name word indices being scrolled
+static volatile LONG       g_joinCross = 0, g_joinMotion = 0;   // chosen crosshair value + motion-comp flag
+static volatile LONG       g_joinTaken = 0;                     // 1 = composed name already loaded (create blocked)
 static bool                g_padConn[4] = { false, false, false, false };  // XInput slot connected? (manager-updated)
+static int g_port = 10666;           // loopback server/connect port; resolved to a free one at startup
 static std::vector<DWORD>  g_hidePids;   // server + clients: their own windows are kept hidden
 // live (alive) seat count -- callers already hold g_clientsLock
 static int LiveCount() { int n = 0; for (auto& c : g_clients) if (c.alive) ++n; return n; }
@@ -133,14 +149,45 @@ static void CreateSeatIn(Client& c) {
     if (c.in) c.in[0] = IN_MAGIC;
 }
 
+// Robustly pull our window to the foreground. The host is launched hidden + grandchild-style, so
+// Windows' focus-stealing prevention makes a plain SetForegroundWindow a no-op -- the host then never
+// holds focus, and keyboard (WM_KEYDOWN) + raw mouse (WM_INPUT, registered without INPUTSINK) only
+// arrive at the FOREGROUND window, so seat 0 gets zero input. Attaching to the current foreground
+// thread's input state lifts that restriction so the activation actually takes. THIS is the focus bug.
+static void ForceForeground(HWND hwnd) {
+    HWND fg = GetForegroundWindow();
+    DWORD myTid = GetCurrentThreadId();
+    DWORD fgTid = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
+    if (fgTid && fgTid != myTid) AttachThreadInput(myTid, fgTid, TRUE);
+    BringWindowToTop(hwnd);
+    SetForegroundWindow(hwnd);
+    SetActiveWindow(hwnd);
+    SetFocus(hwnd);
+    if (fgTid && fgTid != myTid) AttachThreadInput(myTid, fgTid, FALSE);
+}
+
+// Held state of seat 0's keys/mouse-buttons by scancode, so we can release them on focus loss. PushKey
+// only ever drives seat 0 (controllers go through PushButton), so tracking it here is sufficient.
+static bool g_seat0Down[0x110] = { false };
+
 // push one key event into a seat's ring (a = (scancode<<1)|down, b = gk | (char<<16))
 static void PushKey(Client& c, int sc, int gk, int ch, int down) {
     if (!c.in) return;
+    if (sc > 0 && sc < 0x110) g_seat0Down[sc] = (down != 0);   // track for the focus-loss release below
     int slot = c.keyWrite % KEY_RING;
     c.in[8 + slot * 2]     = (sc << 1) | (down & 1);
     c.in[8 + slot * 2 + 1] = (gk & 0xffff) | (ch << 16);
     ++c.keyWrite;
     c.in[5] = c.keyWrite;             // publish last (the DLL reads [5], then the entries)
+}
+
+// Release every key/button seat 0 currently holds. Called when the host loses focus: Alt+Tab forwards
+// Alt-down + Tab-down to seat 0 while we're foreground, then focus leaves before the key-UPs arrive, so
+// those keys would stick down (Tab=automap, etc.) and input feels dead even after tabbing back.
+static void ReleaseSeat0Keys() {
+    if (g_clients.empty()) return;
+    for (int sc = 1; sc < 0x110; ++sc) if (g_seat0Down[sc])
+        PushKey(g_clients[0], sc, 0, 0, 0);   // sends key-up (and clears g_seat0Down[sc])
 }
 
 // accumulate a relative mouse delta for a seat (the DLL consumes + zeroes each frame)
@@ -192,6 +239,16 @@ static void WriteAxis(Client& c, int idx, float v) {
     if (c.in) c.in[IN_AXES + idx] = (LONG)(v * 1000.0f);
 }
 
+// Send a console command to a running seat via the command channel: write the string, then bump the
+// sequence (a barrier) so the DLL runs it exactly once. Used to move music ownership between seats.
+static void WriteCommand(Client& c, const char* cmd) {
+    if (!c.in) return;
+    char* dst = (char*)(c.in + IN_CMDTEXT);
+    _snprintf(dst, IN_CMDMAX, "%s", cmd);
+    dst[IN_CMDMAX - 1] = '\0';
+    InterlockedIncrement(&c.in[IN_CMDSEQ]);   // publish AFTER the text is in place
+}
+
 // --- XInput pads drive seats 1..N-1 (controller index = seat-1). We route each pad's analog
 //     sticks into the engine's OWN joystick axes (the DLL's I_GetAxes hook), so G_BuildTiccmd
 //     does NATIVE analog movement + joystick look -- no keyboard/mouse emulation. Only buttons
@@ -226,19 +283,62 @@ static DWORD WINAPI ReapThread(LPVOID arg) {
     }
     return 0;
 }
-// Tear down one seat: unmap its sections, then reap its process gracefully. Caller holds g_clientsLock;
-// the slow disconnect+wait runs on a detached thread so the compositor never stalls on a drop.
-static void CloseClient(Client& c) {
+// Release our shared-memory views + the process handle for this seat (no process action).
+static void UnmapSeat(Client& c) {
     if (c.view)  { UnmapViewOfFile(c.view); c.view = nullptr; }
     if (c.map)   { CloseHandle(c.map);    c.map = nullptr; }
     if (c.in)    { UnmapViewOfFile((LPCVOID)c.in); c.in = nullptr; }
     if (c.inMap) { CloseHandle(c.inMap);  c.inMap = nullptr; }
+    if (c.hproc) { CloseHandle(c.hproc);  c.hproc = nullptr; }
+}
+// Tear down one seat we are DROPPING (still running): unmap, then reap its process gracefully. Caller
+// holds g_clientsLock; the slow disconnect+wait runs on a detached thread so the compositor never stalls.
+static void CloseClient(Client& c) {
+    UnmapSeat(c);
     if (c.pid) {
         HANDLE t = CreateThread(NULL, 0, ReapThread, (LPVOID)(SIZE_T)c.pid, 0, NULL);
         if (t) CloseHandle(t);
         else { HANDLE p = OpenProcess(PROCESS_TERMINATE, FALSE, c.pid); if (p) { TerminateProcess(p, 0); CloseHandle(p); } }
         c.pid = 0;
     }
+}
+// The seat's process EXITED on its own (in-game "quit game" or a crash): just release our handles and free
+// the slot for reuse. No reap thread -- there's nothing left to quit and its pid may already be recycled.
+static void FreeDeadSeat(Client& c) {
+    UnmapSeat(c);
+    c.pid = 0;
+    c.alive = false;
+}
+
+// Seat 0 (keyboard/mouse) is pinned to slot 0, so this is the live-status of the kbd/mouse player.
+static bool Seat0Alive() { return !g_clients.empty() && g_clients[0].alive && g_clients[0].pad < 0; }
+
+// Free any seat whose process exited on its own -- in-game "quit game" or a crash -- so its slot/pad
+// frees and the dead pane disappears. Runs on the manager thread each tick.
+static void ReapDeadSeats() {
+    EnterCriticalSection(&g_clientsLock);
+    for (auto& c : g_clients)
+        if (c.alive && c.hproc && WaitForSingleObject(c.hproc, 0) == WAIT_OBJECT_0) FreeDeadSeat(c);
+    LeaveCriticalSection(&g_clientsLock);
+}
+
+// Exactly one seat plays music. Seat 0 (the music owner) plays it natively while alive; once it quits or
+// crashes, hand music to the lowest-index live controller seat via the command channel, and take it back
+// when seat 0 rejoins. Only emits a command when ownership actually changes. Runs on the manager thread.
+static int g_musicOwner = -1;   // slot index of the controller currently told to play music, else -1
+static void UpdateMusicOwner() {
+    EnterCriticalSection(&g_clientsLock);
+    int desired = -1;
+    bool seat0 = !g_clients.empty() && g_clients[0].alive && g_clients[0].pad < 0;
+    if (!seat0)
+        for (size_t i = 1; i < g_clients.size(); ++i) if (g_clients[i].alive) { desired = (int)i; break; }
+    if (desired != g_musicOwner) {
+        if (g_musicOwner >= 1 && g_musicOwner < (int)g_clients.size() && g_clients[g_musicOwner].alive)
+            WriteCommand(g_clients[g_musicOwner], "snd_musicvolume 0");           // mute the previous owner
+        if (desired >= 0) WriteCommand(g_clients[desired], "exec splitseat.cfg"); // re-apply global cfg -> music on
+        g_musicOwner = desired;
+    }
+    LeaveCriticalSection(&g_clientsLock);
 }
 
 // Drive every controller seat from its dynamically-assigned pad (c.pad): native analog axes + edge-
@@ -337,6 +437,17 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
+    case WM_ACTIVATE:
+        if ((w & 0xFFFF) != WA_INACTIVE) {   // regained activation (alt-tab back / click on the window)
+            // Raw mouse only flows to the FOREGROUND window and must be re-armed after a focus loss, and
+            // keyboard focus can drift -- re-assert both so seat-0 input resumes immediately on tab-back.
+            RAWINPUTDEVICE rid = { 0x01, 0x02, 0, h };
+            RegisterRawInputDevices(&rid, 1, sizeof(rid));
+            SetFocus(h);
+        } else {                             // lost activation (alt-tab away): drop any keys held into the
+            ReleaseSeat0Keys();              // switch so they don't stick down (the actual alt-tab bug)
+        }
+        break;
     case WM_KEYDOWN: case WM_SYSKEYDOWN:
     case WM_KEYUP:   case WM_SYSKEYUP: {
         if (g_clients.empty()) break;
@@ -440,67 +551,156 @@ static void DeploySeatCfg() {
 // Spawn one stock client, connect it to the already-running loopback server, and add it as a seat.
 // pad = the XInput index that drives it (-1 = seat 0, keyboard+mouse). The slow inject/resume runs
 // WITHOUT the lock so the compositor never freezes during a join; only the brief append takes it.
-// Render res = this seat's pane size for the new live count; the compositor scales that into whatever
-// the pane is later re-tiled to, so re-tiling needs no engine video reset.
-static bool SpawnClient(int pad) {
-    int newCount = LiveCountLocked() + 1;
-    if (newCount > 4) return false;
-    int seat = newCount - 1;
-    int mw = (int)(GetSystemMetrics(SM_CXSCREEN) * g_renderScale);
-    int mh = (int)(GetSystemMetrics(SM_CYSCREEN) * g_renderScale);
-    if (mw < 640) mw = 640;  if (mh < 360) mh = 360;
-    // Every seat renders at the SAME resolution (full screen * renderScale, clamped), so a controller
-    // that joins later tiles identically to seat 0 instead of at a different pane aspect. The compositor
-    // scales each framebuffer into its tile; matching source res => matching panels at every seat count.
-    int pw = mw, ph = mh;
-    if (pw > 1920) pw = 1920;  if (pw < 320) pw = 320;     // bound per-client render cost
-    if (ph > 1080) ph = 1080;  if (ph < 180) ph = 180;
-    // Every seat plays SFX; only seat 0 plays MUSIC (N copies of one track phase into a mess).
-    const char* audio = (seat == 0) ? "" : "+set snd_musicvolume 0 ";
-    char args[700];
-    _snprintf(args, sizeof(args),
-        "-iwad %s -connect 127.0.0.1 +set fullscreen 0 +set freelook 1 +set use_joystick 0 "
-        "+set use_mouse 0 +exec splitseat.cfg %s"
-        "+set vid_defwidth %d +set vid_defheight %d +name P%d",
-        g_launch.iwad, audio, pw, ph, seat + 1);
+// True if any LIVE seat already loaded the profile named `name`. Two seats can't run the same profile at
+// once, so the create screen blocks confirming a name that's already in use.
+static bool NameInUse(const char* name) {
+    bool used = false;
+    EnterCriticalSection(&g_clientsLock);
+    for (auto& c : g_clients) if (c.alive && _stricmp(c.name, name) == 0) { used = true; break; }
+    LeaveCriticalSection(&g_clientsLock);
+    return used;
+}
+
+// Write the generated profile to <gamedir>/profiles/<name>.cfg (the seat +exec's it). core/ss_profile
+// builds the body (name + crosshair, and movebob 0 when motion-sickness comp is on).
+static void WriteProfileCfg(const char* name, int crosshair, int motionComp) {
+    char dir[600]; _snprintf(dir, sizeof(dir), "%s\\profiles", g_launch.cwd); dir[sizeof(dir) - 1] = '\0';
+    CreateDirectoryA(dir, NULL);
+    char path[700]; _snprintf(path, sizeof(path), "%s\\%s.cfg", dir, name); path[sizeof(path) - 1] = '\0';
+    char body[512]; ss::ProfileBuildCfg(body, sizeof(body), name, crosshair, motionComp);
+    FILE* f = fopen(path, "w");
+    if (f) { fputs(body, f); fclose(f); }
+}
+
+// pad = the XInput slot driving the seat (-1 = seat 0, keyboard+mouse). profile = a profiles/<name>.cfg
+// display name (sets its own +name + execs its cfg), or NULL for the default P<seat> identity.
+// This seat's render resolution for `liveCount` active seats: monitor size * base -RenderScale *
+// SmartScale(count) -- smart scaling renders (and reads back) fewer pixels as more seats join, clamped
+// to a usable window. SS_SMARTSCALE=0 falls back to the fixed base scale.
+static void DesiredRes(int liveCount, int& w, int& h) {
+    // base = monitor * user -RenderScale, capped first so 1-player cost stays bounded even on a huge
+    // display; THEN smart-scale DOWN by seat count (capping after would make every count clamp to the
+    // same max on >1080p monitors and defeat the point).
+    int bw = (int)(GetSystemMetrics(SM_CXSCREEN) * g_renderScale);
+    int bh = (int)(GetSystemMetrics(SM_CYSCREEN) * g_renderScale);
+    if (bw > 1920) bw = 1920;  if (bh > 1080) bh = 1080;   // ceil: bound per-client cost
+    float s = g_smartScale ? ss::SmartScale(liveCount) : 1.0f;
+    w = (int)(bw * s);  h = (int)(bh * s);
+    if (w < 640) w = 640;  if (h < 360) h = 360;           // floor: usable minimum
+}
+
+// Each seat launches at the smart-scaled resolution for the session's player count and KEEPS it for its
+// lifetime -- changing an injected client's video mode at runtime hangs it (vid_setmode tears down the
+// GL context/window while our hide-thread + swap hook are live), so we pick the res once, up front. For
+// an `-Players N` session every seat renders at SmartScale(N); a later drop-in uses its own join count.
+static bool SpawnClient(int pad, const char* profile) {
+    // The SLOT index IS the seat's identity: seat 0 (kbd/mouse) is always slot 0 (-> seat0.ini, +name P1,
+    // music owner); controllers take the lowest free slot 1..3. Stable + unique across quits/rejoins, so a
+    // rejoining seat never collides with another seat's config or loses its seat-0 music role. (Computing
+    // the index from the live count instead made a rejoin land on a dead seat's identity.)
+    int slot = -1;
+    EnterCriticalSection(&g_clientsLock);
+    if (pad < 0) slot = 0;
+    else {
+        for (size_t i = 1; i < g_clients.size() && slot < 0; ++i) if (!g_clients[i].alive) slot = (int)i;
+        if (slot < 0 && g_clients.size() < 4) { slot = (int)g_clients.size(); if (slot < 1) slot = 1; }
+    }
+    int liveCount = LiveCount();
+    LeaveCriticalSection(&g_clientsLock);
+    if (slot < 0 || slot > 3) return false;   // window full
+    int seat = slot;
+    int target = g_launch.n > liveCount + 1 ? g_launch.n : liveCount + 1;   // the -Players N batch shares a res
+    if (target > 4) target = 4;
+    // ss_profile bakes in the seat's identity/music and re-clamps the res. (GetSystemMetrics = host glue.)
+    int mw, mh; DesiredRes(target, mw, mh);
+    char args[820];
+    ss::BuildClientArgs(args, sizeof(args), seat, g_launch.iwad, g_port, mw, mh, profile);
     Launch L = InjectSuspended(g_launch.dll, g_launch.exe, g_launch.cwd, args);
     DWORD pid = ResumeAfterHooks(L);
     if (!pid) return false;
     Client c; c.pid = pid; c.pad = pad; c.alive = true;
+    c.hproc = OpenProcess(SYNCHRONIZE, FALSE, pid);   // watch for quit-game/crash (ReapDeadSeats below)
+    if (profile && profile[0]) _snprintf(c.name, sizeof(c.name), "%s", profile);   // its profile name (dedup)
+    else                       _snprintf(c.name, sizeof(c.name), "P%d", seat + 1); // default identity
+    c.name[sizeof(c.name) - 1] = '\0';
     CreateSeatIn(c);
     EnterCriticalSection(&g_clientsLock);
-    bool placed = false;
-    for (auto& slot : g_clients) if (!slot.alive) { slot = c; placed = true; break; }   // reuse a freed slot
-    if (!placed && g_clients.size() < 4) { g_clients.push_back(c); placed = true; }      // else append (<=4)
+    while ((int)g_clients.size() <= slot) g_clients.push_back(Client());   // grow to the slot (dead placeholders)
+    g_clients[slot] = c;
     LeaveCriticalSection(&g_clientsLock);
-    if (placed) g_hidePids.push_back(pid);
+    g_hidePids.push_back(pid);
     InterlockedIncrement(&g_launchN);
-    return placed;
+    return true;
+}
+
+// True if INADDR_ANY:port can't be bound right now -- i.e. someone holds it. Binding INADDR_ANY matches
+// the stock server's own bind, so this is an accurate "free?" test (loopback-only would miss conflicts).
+// Assumes WSAStartup has already run.
+static bool PortInUse(int port) {
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return false;
+    sockaddr_in a; memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET; a.sin_port = htons((u_short)port); a.sin_addr.s_addr = htonl(INADDR_ANY);
+    int r = bind(s, (sockaddr*)&a, sizeof(a));
+    closesocket(s);
+    return r != 0;   // bind failed -> in use
+}
+
+// First bindable port at or above `start` (Zandronum's DEFAULT_SERVER_PORT = 10666). Falls back to
+// `start` if the whole window is busy. Assumes WSAStartup has already run.
+static int PickFreeUdpPort(int start) {
+    for (int p = start; p < start + 64; ++p)
+        if (!PortInUse(p)) return p;
+    return start;
 }
 
 static DWORD WINAPI ManagerThread(LPVOID) {
     DeploySeatCfg();
-    char srvArgs[600];
-    _snprintf(srvArgs, sizeof(srvArgs),
-        "-host -iwad %s +map MAP01 +set sv_cooperative 1 +set sv_maxclients 8 +set sv_maxplayers 8 "
-        "+set sv_maxclientsperip 8 +set sv_updatemaster 0 +set fullscreen 0", g_launch.iwad);
-    Launch srv = InjectSuspended(g_launch.dll, g_launch.exe, g_launch.cwd, srvArgs);
-    DWORD srvPid = ResumeAfterHooks(srv);
+    // The stock server FATAL-ERRORS if its port is busy (BindToLocalPort -> I_FatalError, no fallback). So:
+    // probe a free port, host on it, and CONFIRM the server actually bound it before launching any client.
+    // If the server lost the port to a race or crashed, re-probe + relaunch -- clients then never sit
+    // forever retrying a server that isn't there (the old "stuck connecting" bug).
+    WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
+    DWORD srvPid = 0;
+    for (int attempt = 0; attempt < 4 && !srvPid; ++attempt) {
+        g_port = PickFreeUdpPort(10666 + attempt);   // step the base each retry so a wedged port isn't re-picked
+        char srvArgs[600];
+        _snprintf(srvArgs, sizeof(srvArgs),
+            "-host -iwad %s -port %d -config splitdronum-server.ini +map MAP01 +set sv_cooperative 1 +set sv_maxclients 8 "
+            "+set sv_maxplayers 8 +set sv_maxclientsperip 8 +set sv_updatemaster 0 +set fullscreen 0", g_launch.iwad, g_port);
+        Launch srv = InjectSuspended(g_launch.dll, g_launch.exe, g_launch.cwd, srvArgs);
+        DWORD pid = ResumeAfterHooks(srv);
+        bool up = false;
+        for (int i = 0; i < 150 && !up; ++i) { Sleep(100); up = PortInUse(g_port); }   // wait <=15s for it to bind g_port
+        if (up) srvPid = pid;                                                           // confirmed hosting on g_port
+        else if (pid) { HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, pid); if (h) { TerminateProcess(h, 0); CloseHandle(h); } }
+    }
     if (srvPid) g_hidePids.push_back(srvPid);
-    Sleep(1000);                        // let the server bind its socket; -connect retries cover the rest
 
-    SpawnClient(-1);                    // seat 0 = keyboard + mouse (fullscreen)
+    g_clients.reserve(4);               // pin storage (<=4 seats) so the lock-free input path never races a realloc
+    SpawnClient(-1, nullptr);           // seat 0 = keyboard + mouse (fullscreen)
     int initial = g_launch.n; if (initial > 4) initial = 4;
-    for (int s = 1; s < initial; ++s) SpawnClient(s - 1);   // CLI -Players N: pre-assign pads 0..N-2 for testing
+    for (int s = 1; s < initial; ++s) SpawnClient(s - 1, nullptr);   // CLI -Players N: pre-assign pads 0..N-2 for testing
 
     // Drop-in loop: feed assigned pads; watch UNassigned pads for Start -> confirm card -> A to join,
     // B / timeout to cancel. The compositor re-tiles automatically (layout is a function of live count).
-    DWORD promptStart = 0;
     DWORD padCheck[4] = { 0, 0, 0, 0 };   // last poll of a DISCONNECTED slot (throttle the slow empty-slot query)
-    WORD  joinPrev[4] = { 0, 0, 0, 0 };   // edge-detect START on unassigned pads
+    WORD  joinPrev[4] = { 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF };   // join-button edge-detect; 0xFFFF = not yet baselined
+    DWORD bannerUntil = 0;                // the active join flow aborts once this idle deadline passes
+    ss::JoinState js;                     // the (tested) join state machine's state; published to g_join* below
+    bool seat0EnterPrev = false;        // edge-detect Enter for the keyboard-player rejoin
     for (;;) {
         FeedGameplay();
+        ReapDeadSeats();                // free seats that quit-game or crashed on their own
+        UpdateMusicOwner();             // keep exactly one seat on music (hand off when seat 0 quits/rejoins)
         DWORD now = timeGetTime();
+
+        // Seat 0 (keyboard/mouse) rejoin -- a DIFFERENT path than controllers (no pad, no START button):
+        // once it has quit/crashed, pressing Enter while the host is focused respawns it (back in slot 0)
+        // with its default identity + the global config, the keyboard analog of a controller pressing Start.
+        bool seat0Enter = (g_hwnd && GetForegroundWindow() == g_hwnd) && (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
+        if (seat0Enter && !seat0EnterPrev && !Seat0Alive() && LiveCountLocked() < 4) SpawnClient(-1, nullptr);
+        seat0EnterPrev = seat0Enter;
 
         // Refresh connection: poll a connected slot every loop, a disconnected one only ~1/s. XInput's
         // empty-slot query is slow, so hammering all four every frame is the documented perf hit.
@@ -525,25 +725,55 @@ static DWORD WINAPI ManagerThread(LPVOID) {
             if (freePad >= 0) { EnterCriticalSection(&g_clientsLock); g_clients[waitingSeat].pad = freePad; LeaveCriticalSection(&g_clientsLock); }
         }
 
-        // Join: an UNassigned, connected pad that NEWLY presses START (edge, not held or a reconnect
-        // transient) raises the card; A confirms, B / a 15s timeout / the pad unplugging cancels.
-        LONG jp = InterlockedCompareExchange(&g_joinPad, -1, -1);
-        if (jp < 0) {
+        // Join: any UNassigned, connected controller that presses ANY (newly-pressed) button joins as a
+        // new seat -- so it's obvious which pad joined, with no specific button to hunt for. The overlay
+        // (g_joinPad) names the free controller, or invites a press when several are free.
+        // Create flow: the host reads XInput + edge-detects buttons; core/ss_join (100%-tested) decides the
+        // transitions. START opens the prompt; A/X/Y advances through name-word-1, name-word-2, crosshair,
+        // motion-comp and finally creates+joins; dpad L/R scrolls the current field; B backs out a step;
+        // unplug or a 20s idle deadline aborts. (sticks/shoulders never start it -- only a fresh START.)
+        {
             bool room = LiveCountLocked() < 4;
-            for (int p = 0; p < 4; ++p) {
-                if (!g_padConn[p] || PadAssigned(p)) { joinPrev[p] = 0; continue; }
+            bool taken = false;   // 1 = the currently-composed name is already loaded (create blocked)
+            if (js.pad < 0) {
+                for (int p = 0; p < 4; ++p) {            // idle: scan free pads for a fresh START press
+                    if (!g_padConn[p] || PadAssigned(p)) { joinPrev[p] = 0xFFFF; continue; }
+                    XINPUT_STATE xs;
+                    if (XInputGetState(p, &xs) != ERROR_SUCCESS) { joinPrev[p] = 0xFFFF; continue; }
+                    WORD b = xs.Gamepad.wButtons, prev = joinPrev[p]; joinPrev[p] = b;
+                    bool start = (prev != 0xFFFF) && (b & XINPUT_GAMEPAD_START & ~prev) != 0;
+                    if (ss::JoinTryStart(js, p, start, room)) { bannerUntil = now + 20000; break; }
+                }
+            } else {
                 XINPUT_STATE xs;
-                if (XInputGetState(p, &xs) != ERROR_SUCCESS) { joinPrev[p] = 0; continue; }
-                WORD b = xs.Gamepad.wButtons;
-                if (room && (b & XINPUT_GAMEPAD_START) && !(joinPrev[p] & XINPUT_GAMEPAD_START)) { InterlockedExchange(&g_joinPad, p); promptStart = now; }
-                joinPrev[p] = b;
+                bool ok = (js.pad < 4) && g_padConn[js.pad] && (XInputGetState((DWORD)js.pad, &xs) == ERROR_SUCCESS);
+                WORD b = ok ? xs.Gamepad.wButtons : 0, prev = joinPrev[js.pad]; joinPrev[js.pad] = b;
+                WORD nb = b & ~prev;                     // newly pressed this frame
+                if (nb) bannerUntil = now + 20000;       // any input keeps the flow alive
+                ss::JoinInput in;
+                in.newButtons = ((nb & XINPUT_GAMEPAD_START) ? ss::JB_START : 0)
+                              | ((nb & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_X | XINPUT_GAMEPAD_Y)) ? ss::JB_CONFIRM : 0)
+                              | ((nb & XINPUT_GAMEPAD_B) ? ss::JB_CANCEL : 0)
+                              | ((nb & XINPUT_GAMEPAD_DPAD_LEFT)  ? ss::JB_LEFT  : 0)
+                              | ((nb & XINPUT_GAMEPAD_DPAD_RIGHT) ? ss::JB_RIGHT : 0);
+                in.connected      = ok;
+                in.timedOut       = (now > bannerUntil);
+                in.word1Count     = ss::ProfileWord1Count();
+                in.word2Count     = ss::ProfileWord2Count();
+                in.crosshairCount = ss::kCrosshairMax + 1;
+                char curName[64]; ss::ProfileComposeName(curName, sizeof(curName), js.word1, js.word2);
+                in.nameInUse = NameInUse(curName);       // two seats can't load the same profile at once
+                taken = in.nameInUse;
+                ss::JoinResult r = ss::JoinAdvance(js, in);
+                if (r.action == ss::JoinAction::Join) {
+                    char nm[64]; ss::ProfileComposeName(nm, sizeof(nm), r.word1, r.word2);
+                    WriteProfileCfg(nm, r.crosshair, r.motionComp);   // save profiles/<name>.cfg, then spawn it
+                    SpawnClient(r.pad, nm);
+                }
             }
-        } else {
-            XINPUT_STATE xs;
-            bool conn = (jp >= 0 && jp < 4) && g_padConn[jp];
-            bool ok = conn && (XInputGetState((DWORD)jp, &xs) == ERROR_SUCCESS);
-            if (ok && (xs.Gamepad.wButtons & XINPUT_GAMEPAD_A))      { InterlockedExchange(&g_joinPad, -1); SpawnClient((int)jp); }
-            else if (!conn || (ok && (xs.Gamepad.wButtons & XINPUT_GAMEPAD_B)) || now - promptStart > 15000) InterlockedExchange(&g_joinPad, -1);
+            InterlockedExchange(&g_joinPad, js.pad);     // publish for the render thread (DrawJoinPrompt reads these)
+            g_joinStep = js.step; g_joinW1 = js.word1; g_joinW2 = js.word2;
+            g_joinCross = js.crosshair; g_joinMotion = js.motionComp; g_joinTaken = taken;
         }
         Sleep(8);
     }
@@ -634,20 +864,23 @@ static bool InitD3D(HWND hwnd) {
     return true;
 }
 
-// Confirm card. The D3D compositor has no font system, so GDI-render "Player N / A to join, B to
-// cancel" into a DIB once (rebuilt only when N changes), upload it as a texture, and draw it centered.
-// Assumes the caller has already bound the shader/sampler/raster/topology (RenderD3D does).
+// The create-and-join card. The D3D compositor has no font system, so GDI-render the current step (name
+// words / crosshair / motion-comp) into a DIB, rebuilt only when the shown state changes, upload it as a
+// texture, and draw it centered. Assumes the caller bound the shader/sampler/raster/topology (RenderD3D).
 static ID3D11Texture2D*          g_promptTex = nullptr;
 static ID3D11ShaderResourceView* g_promptSrv = nullptr;
 static int g_promptN = -1, g_promptW = 0, g_promptH = 0;
-static void DrawJoinPrompt(int W, int H, int live) {
-    if (InterlockedCompareExchange(&g_joinPad, -1, -1) < 0) return;
-    int n = live + 1;
-    if (n != g_promptN || !g_promptSrv) {
-        g_promptN = n;
+static void DrawJoinPrompt(ss::Rect area) {
+    LONG jp = InterlockedCompareExchange(&g_joinPad, -1, -1);
+    if (jp < 0) return;
+    int step = (int)g_joinStep, w1 = (int)g_joinW1, w2 = (int)g_joinW2;
+    int cross = (int)g_joinCross, motion = (int)g_joinMotion, taken = (int)g_joinTaken;
+    int key = ((((((int)jp * 8 + step) * 16 + w1) * 16 + w2) * 16 + cross) * 2 + motion) * 2 + taken;
+    if (key != g_promptN || !g_promptSrv) {
+        g_promptN = key;
         if (g_promptSrv) { g_promptSrv->Release(); g_promptSrv = nullptr; }
         if (g_promptTex) { g_promptTex->Release(); g_promptTex = nullptr; }
-        const int TW = 560, TH = 120; g_promptW = TW; g_promptH = TH;
+        const int TW = 660, TH = 152; g_promptW = TW; g_promptH = TH;
         BITMAPINFO bi = { 0 };
         bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
         bi.bmiHeader.biWidth = TW; bi.bmiHeader.biHeight = TH;   // bottom-up to match the shader's V-flip
@@ -659,16 +892,32 @@ static void DrawJoinPrompt(int W, int H, int live) {
         RECT r = { 0, 0, TW, TH };
         HBRUSH bg = CreateSolidBrush(RGB(24, 26, 34)); FillRect(dc, &r, bg); DeleteObject(bg);
         SetBkMode(dc, TRANSPARENT);
-        HFONT f1 = CreateFontA(40, 0, 0, 0, FW_BOLD, 0, 0, 0, 0, 0, 0, ANTIALIASED_QUALITY, 0, "Segoe UI");
-        HGDIOBJ of = SelectObject(dc, f1);
-        char l1[48]; _snprintf(l1, sizeof(l1), "Player %d", n);
+        HFONT ft = CreateFontA(32, 0, 0, 0, FW_BOLD,   0, 0, 0, 0, 0, 0, ANTIALIASED_QUALITY, 0, "Segoe UI");
+        HFONT fb = CreateFontA(40, 0, 0, 0, FW_BOLD,   0, 0, 0, 0, 0, 0, ANTIALIASED_QUALITY, 0, "Segoe UI");
+        HFONT fs = CreateFontA(23, 0, 0, 0, FW_NORMAL, 0, 0, 0, 0, 0, 0, ANTIALIASED_QUALITY, 0, "Segoe UI");
+        char l1[48]; _snprintf(l1, sizeof(l1), "Controller %d", (int)jp + 1);
+        HGDIOBJ of = SelectObject(dc, ft);
         SetTextColor(dc, RGB(236, 239, 250));
-        RECT r1 = { 0, 16, TW, 62 }; DrawTextA(dc, l1, -1, &r1, DT_CENTER | DT_SINGLELINE);
-        HFONT f2 = CreateFontA(26, 0, 0, 0, FW_NORMAL, 0, 0, 0, 0, 0, 0, ANTIALIASED_QUALITY, 0, "Segoe UI");
-        SelectObject(dc, f2); DeleteObject(f1);
-        SetTextColor(dc, RGB(168, 198, 255));
-        RECT r2 = { 0, 66, TW, 106 }; DrawTextA(dc, "A  join          B  cancel", -1, &r2, DT_CENTER | DT_SINGLELINE);
-        SelectObject(dc, of); DeleteObject(f2);
+        RECT r1 = { 0, 14, TW, 52 }; DrawTextA(dc, l1, -1, &r1, DT_CENTER | DT_SINGLELINE);
+        char nm[64]; ss::ProfileComposeName(nm, sizeof(nm), w1, w2);
+        char mid[160]; const char* hint = "dpad change      A  next      B  back";
+        if (step == ss::JS_PROMPT) {
+            _snprintf(mid, sizeof(mid), "press  A  to make a player");  hint = "B  cancel";
+        } else if (step == ss::JS_WORD1) {                // scrolling the first name word
+            _snprintf(mid, sizeof(mid), "<  %s  >%s", ss::ProfileWord1(w1), ss::ProfileWord2(w2));
+        } else if (step == ss::JS_WORD2) {                // scrolling the second name word
+            _snprintf(mid, sizeof(mid), "%s<  %s  >", ss::ProfileWord1(w1), ss::ProfileWord2(w2));
+        } else if (step == ss::JS_CROSSHAIR) {            // picking a crosshair
+            _snprintf(mid, sizeof(mid), "%s    crosshair <  %d  >", nm, cross);
+        } else {                                          // ss::JS_MOTION -- motion-sickness comp
+            _snprintf(mid, sizeof(mid), "%s    motion comp <  %s  >", nm, motion ? "ON" : "off");
+            hint = taken ? "name taken -- scroll to another      B  back" : "A  create + join      B  back";
+        }
+        SelectObject(dc, fb); SetTextColor(dc, taken ? RGB(255, 140, 140) : RGB(150, 220, 255));
+        RECT r2 = { 0, 56, TW, 106 }; DrawTextA(dc, mid, -1, &r2, DT_CENTER | DT_SINGLELINE);
+        SelectObject(dc, fs); SetTextColor(dc, RGB(140, 150, 170));
+        RECT r3 = { 0, 114, TW, 146 }; DrawTextA(dc, hint, -1, &r3, DT_CENTER | DT_SINGLELINE);
+        SelectObject(dc, of); DeleteObject(ft); DeleteObject(fb); DeleteObject(fs);
         unsigned char* px = (unsigned char*)bits;
         for (int i = 0; i < TW * TH; ++i) px[i * 4 + 3] = 255;   // GDI leaves alpha 0 -> make the card opaque
         D3D11_TEXTURE2D_DESC td = { 0 };
@@ -676,13 +925,14 @@ static void DrawJoinPrompt(int W, int H, int live) {
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         D3D11_SUBRESOURCE_DATA sd = { bits, (UINT)(TW * 4), 0 };
-        if (SUCCEEDED(g_dev->CreateTexture2D(&td, &sd, &g_promptTex)))   // build the texture BEFORE freeing the DIB
+        if (SUCCEEDED(g_dev->CreateTexture2D(&td, &sd, &g_promptTex)))
             g_dev->CreateShaderResourceView(g_promptTex, nullptr, &g_promptSrv);
         SelectObject(dc, ob); DeleteObject(bmp); DeleteDC(dc);
     }
     if (g_promptSrv) {
-        D3D11_VIEWPORT vp = { (float)((W - g_promptW) / 2), (float)((H - g_promptH) / 2),
-                              (float)g_promptW, (float)g_promptH, 0.0f, 1.0f };
+        int cx = area.x + (area.w - g_promptW) / 2;       // center the card within `area`:
+        int cy = area.y + (area.h - g_promptH) / 2;       // a reserved pane while customizing, else whole window
+        D3D11_VIEWPORT vp = { (float)cx, (float)cy, (float)g_promptW, (float)g_promptH, 0.0f, 1.0f };
         g_ctx->RSSetViewports(1, &vp);
         g_ctx->PSSetShaderResources(0, 1, &g_promptSrv);
         g_ctx->Draw(4, 0);
@@ -748,7 +998,13 @@ static void RenderD3D(HWND hwnd) {
     g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     EnterCriticalSection(&g_clientsLock);
     int live = LiveCount();
-    ss::Layout lay = ss::ComputeLayout(live, W, H, ss::TwoMode::Auto);
+    // A controller that confirmed the prompt and is customizing reserves its OWN pane up front, so the
+    // create card sits in its panel (seat 0 shrinks beside it) instead of overlapping the live seats. The
+    // pane stays put when the seat actually spawns on the final confirm -> no layout jump, no overlap.
+    int joinPad  = (int)InterlockedCompareExchange(&g_joinPad, -1, -1);
+    int joinStep = (int)g_joinStep;
+    int pending  = (joinPad >= 0 && joinStep >= ss::JS_WORD1 && live < 4) ? 1 : 0;
+    ss::Layout lay = ss::ComputeLayout(live + pending, W, H, ss::TwoMode::Auto);
     int pane = 0;
     for (size_t i = 0; i < g_clients.size() && i < 4; ++i) {
         if (!g_clients[i].alive || pane >= lay.count) continue;
@@ -803,7 +1059,19 @@ static void RenderD3D(HWND hwnd) {
         pane++;   // an alive seat reserves its pane even before its first frame (stable tiling on join)
     }
     LeaveCriticalSection(&g_clientsLock);
-    DrawJoinPrompt(W, H, live);
+    // While customizing, draw the create card in the reserved pane (pane == live now); for the brief
+    // "press A" prompt (no reserved pane) center it over the whole window.
+    ss::Rect area = (pending && pane < lay.count) ? lay.panes[pane] : ss::Rect{ 0, 0, W, H };
+    DrawJoinPrompt(area);
+    if (!Seat0Alive()) {   // seat 0 (kbd/mouse) quit/crashed -- invite a keyboard rejoin (top-center banner)
+        int tw, th; ID3D11ShaderResourceView* s = TextTexture("seat 0 left  -  press Enter to rejoin", &tw, &th);
+        if (s) {
+            D3D11_VIEWPORT vp = { (float)((W - tw) / 2), 24.0f, (float)tw, (float)th, 0.0f, 1.0f };
+            g_ctx->RSSetViewports(1, &vp);
+            g_ctx->PSSetShaderResources(0, 1, &s);
+            g_ctx->Draw(4, 0);
+        }
+    }
     // backbuffer dump for verification: set SS_CAPTURE, then drop a "capture.now" file in the cwd.
     // Gated on the env once so there is zero per-frame cost in normal use.
     static int s_capOn = -1;
@@ -915,6 +1183,7 @@ int main(int argc, char** argv) {
       if (rs && *rs) { g_renderScale = (float)atof(rs);
           if (g_renderScale < 0.25f) g_renderScale = 0.25f;     // floor: don't render absurdly low
           if (g_renderScale > 2.0f)  g_renderScale = 2.0f; } }  // ceil: supersample at most 2x
+    { const char* sm = getenv("SS_SMARTSCALE"); if (sm && sm[0] == '0') g_smartScale = false; }  // opt out
 
     FILE* L = fopen("host_debug.log", "w");
 
@@ -933,11 +1202,21 @@ int main(int argc, char** argv) {
     wc.hInstance = GetModuleHandleA(NULL);
     wc.lpszClassName = "SplitdronumHost";
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    // App icon (resource ID 1 from host.rc) for the title bar + taskbar. The embedded .ico only sets
+    // the EXE's file icon in Explorer; the *window/taskbar* icon comes from the class hIcon (large), so
+    // load it from the same resource. The small (title-bar) icon is set via WM_SETICON after creation.
+    HICON hIconBig = (HICON)LoadImageA(wc.hInstance, MAKEINTRESOURCE(1), IMAGE_ICON,
+        GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR);
+    HICON hIconSm  = (HICON)LoadImageA(wc.hInstance, MAKEINTRESOURCE(1), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
+    wc.hIcon = hIconBig;
     RegisterClassA(&wc);
     HWND hwnd = CreateWindowExA(0, wc.lpszClassName, "splitdronum", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT, 1280, 720, NULL, NULL, wc.hInstance, NULL);
     if (!hwnd) { if (L) { fprintf(L, "CreateWindow failed err=%lu\n", GetLastError()); fflush(L); } return 2; }
-    SetForegroundWindow(hwnd);
+    if (hIconBig) SendMessageA(hwnd, WM_SETICON, ICON_BIG,   (LPARAM)hIconBig);   // taskbar / Alt+Tab
+    if (hIconSm)  SendMessageA(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)hIconSm);    // title bar
+    ForceForeground(hwnd);   // robustly claim focus (plain SetForegroundWindow no-ops for our hidden launch)
     timeBeginPeriod(1);   // 1ms scheduler tick so the present loop runs uncapped, not ~64fps
 
     RAWINPUTDEVICE rid = { 0x01, 0x02, 0, hwnd };   // HID generic mouse -> WM_INPUT to this window
@@ -974,8 +1253,15 @@ int main(int argc, char** argv) {
             // startup, take it back so input stays on seat 0 -- but yield to a real user alt-tab.
             HWND fg = GetForegroundWindow();
             if (fg != hwnd) {
+                static DWORD s_start = now;                       // host launches hidden -> Windows can
+                bool startupPhase = (now - s_start) < 6000;       // leave it un-foregrounded; force it
                 DWORD fgPid = 0; GetWindowThreadProcessId(fg, &fgPid);
-                for (DWORD p : g_hidePids) if (p == fgPid) { SetForegroundWindow(hwnd); break; }
+                bool childFg = false;
+                for (DWORD p : g_hidePids) if (p == fgPid) { childFg = true; break; }
+                // Reclaim from our own hidden child windows always (a startup race stole focus); during
+                // the startup window, force it unconditionally so the host actually lands in front. Once
+                // settled we leave a real foreign app alone (the user deliberately alt-tabbed away).
+                if (childFg || startupPhase) ForceForeground(hwnd);
             }
             // (Controller pads are polled by the manager thread now -- it owns join/leave + gameplay.)
             // Hybrid mouse-free: release the mouse when seat 0 (the mouse user) is in a menu/console,

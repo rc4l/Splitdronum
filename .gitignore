@@ -3,5 +3,16 @@ build/
 *.pdb
 *.exe
 *.ilk
-dll/ss_offsets.h   # generated from the built engine at DLL-build time
 *.log
+
+# fetched dependencies: Qt (aqtinstall, ~2 GB) etc. -- never commit
+deps/
+
+# generated from the built engine at DLL-build time
+dll/ss_offsets.h
+
+# private engine copy + per-seat configs created at runtime (machine-specific, never commit)
+engine/
+
+# packaged engine release asset (built by package-engine.ps1, uploaded to a GitHub Release)
+engine.zip

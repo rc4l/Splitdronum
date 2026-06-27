@@ -74,4 +74,10 @@ void TargetSize(Rect pane, int& rw, int& rh) {
     if (rh < 200) rh = 200;
 }
 
+float SmartScale(int liveCount) {
+    if (liveCount <= 1) return 1.0f;   // sole seat owns the whole window -> render at full res
+    if (liveCount == 2) return 0.75f;  // half the window each -> a touch lower
+    return 0.5f;                       // 3-4 seats: a quadrant each -> half res (a quarter the readback)
+}
+
 }  // namespace ss

@@ -26,4 +26,9 @@ Rect Letterbox(Rect pane, int fw, int fh);
 // down to a multiple of 8, clamped to a 320x200 minimum.
 void TargetSize(Rect pane, int& rw, int& rh);
 
+// Per-seat render-scale multiplier as a function of the live seat count: more seats means a smaller
+// pane each, so render (and read back) proportionally fewer pixels. 1 = 1.0 (full), 2 = 0.75, 3+ = 0.5.
+// Multiplied onto the user's base -RenderScale; the host re-applies it live as seats join/leave.
+float SmartScale(int liveCount);
+
 }  // namespace ss

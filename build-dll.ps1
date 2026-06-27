@@ -4,7 +4,7 @@
 # as (module base + RVA) at runtime with NO fragile runtime DbgHelp. Pass -GamePath if your
 # Zandronum build is not in the sibling repo's build\Release.
 param(
-    [string]$GamePath = (Join-Path $PSScriptRoot '..\zandronum-vscode-windows\build\Release\zandronum.exe')
+    [string]$GamePath = (Join-Path $PSScriptRoot '..\zandronum-windows\build\Release\zandronum.exe')
 )
 $ErrorActionPreference = 'Continue'
 $root = $PSScriptRoot
@@ -32,7 +32,7 @@ $GamePath = (Resolve-Path $GamePath).Path
 cmd /c "`"$vcvars`" >nul && cd /d `"$out`" && cl /nologo /O2 /Fe:gen_offsets.exe `"$gen`" dbghelp.lib"
 if (-not (Test-Path (Join-Path $out 'gen_offsets.exe'))) { Write-Host 'ERROR: gen_offsets build failed.'; exit 3 }
 # Engine symbols the DLL needs (single source of truth; the DLL references SS_RVA_<name>):
-& (Join-Path $out 'gen_offsets.exe') $GamePath $offh 'D_PostEvent' 'menuactive' 'ConsoleState' 'AppActive' 'I_GetAxes'
+& (Join-Path $out 'gen_offsets.exe') $GamePath $offh 'D_PostEvent' 'menuactive' 'ConsoleState' 'AppActive' 'I_GetAxes' 'GUICapture' 'g_ulChatMode' 'AddCommandString'
 if ($LASTEXITCODE -ne 0) { Write-Host 'ERROR: engine symbol extraction failed (see above) -- aborting.'; exit 3 }
 Write-Host ("ss_offsets.h: " + (Test-Path $offh))
 

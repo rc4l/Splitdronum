@@ -101,6 +101,11 @@ LONG WINAPI HookedSetWLW(HWND h, int idx, LONG v) {
 struct EngEvent { unsigned char type, subtype; short data1, data2, data3; int x, y; };
 typedef void(*PostEvent_t)(const EngEvent*);
 PostEvent_t g_postEvent = nullptr;
+// AddCommandString(text, keynum=0): run a console command line. Drives the host's runtime command channel
+// (handing music ownership to another seat when seat 0 quits). Benign cvar/exec only -- never vid_setmode.
+typedef void(*AddCmd_t)(char*, int);
+AddCmd_t g_addCmd = nullptr;
+LONG     g_cmdSeq = 0;
 // d_event.h EGenericEvent + d_gui.h EGUIEvent subtypes -- the engine's event protocol (stable).
 enum { EV_KeyDown = 1, EV_KeyUp = 2, EV_Mouse = 3, EV_GUI_Event = 4 };
 enum { GUI_KeyDown = 1, GUI_KeyUp = 3, GUI_Char = 4,        // d_gui.h EGUIEvent subtypes
@@ -114,6 +119,15 @@ int* g_menuActive = nullptr;
 // Engine console state (c_up=0, c_down=1, c_falling=2, c_rising=3). The console takes GUI input
 // when down/falling (C_Responder's own condition), so we route text to it just like a menu.
 int* g_consoleState = nullptr;
+// Engine global: nonzero whenever the GUI owns the keyboard -- a menu, the console, OR chat
+// (messagemode) and any other text field. The single source of truth the native input layer uses to
+// decide GUI-vs-gameplay routing; reading it directly is what makes chat/say work (chat is neither a
+// menu nor the console, so the menu+console reconstruction missed it).
+unsigned char* g_guiCapture = nullptr;
+// Zandronum's chat (messagemode/say) is its OWN system, separate from ZDoom's GUICapture: opening chat
+// only sets g_ulChatMode (CHATMODE_NONE=0 when not chatting). CHAT_Input consumes EV_GUI_Events, so we
+// must route input as GUI while this is nonzero -- otherwise 't' opens chat but you can't type/send/escape.
+unsigned int* g_chatMode = nullptr;
 // Virtual GUI cursor for menus/console: use_mouse 0 kills the engine's native cursor, so we feed
 // EV_GUI_MouseMove ourselves, driving an absolute cursor with the same per-frame mouse deltas.
 int  g_vpW = 640, g_vpH = 360;     // current render size, refreshed each frame in HookedSwap
@@ -130,8 +144,11 @@ volatile int* g_appActive = nullptr;
 typedef void(*GetAxes_t)(float*);
 GetAxes_t  g_realGetAxes = nullptr;
 const int  NUM_JOYAXIS = 5;
-const int  IN_AXES = 136;   // ZanIN int index of the 5 fixed-point axes (host writes value x1000)
-const int  IN_MENU = 160;   // ZanIN int the DLL writes BACK: 1 = this seat is in a menu/console
+const int  IN_AXES    = 136;   // ZanIN int index of the 5 fixed-point axes (host writes value x1000)
+const int  IN_MENU    = 160;   // ZanIN int the DLL writes BACK: 1 = this seat is in a menu/console
+const int  IN_CMDSEQ  = 164;   // host bumps this after writing a console command at IN_CMDTEXT
+const int  IN_CMDTEXT = 168;   // the command string (bytes), up to IN_CMDMAX
+const int  IN_CMDMAX  = 120;
 
 // Host -> client input: shared section "ZanIN_<pid>" (1 KB of ints). The host writes raw input;
 // the DLL forwards it as engine events and lets the engine do binds / menu / look.
@@ -158,15 +175,33 @@ void ApplyInput() {
         g_in = (volatile LONG*)MapViewOfFile(g_inMap, FILE_MAP_ALL_ACCESS, 0, 0, IN_BYTES);
         if (g_in == nullptr) { CloseHandle(g_inMap); g_inMap = nullptr; return; }
         g_keyRead = g_in[5];                                  // start at the host's write head
+        g_cmdSeq  = g_in[IN_CMDSEQ];                           // don't replay a command issued before we mapped
     }
     if (g_in[0] != IN_MAGIC || !g_postEvent) return;
+
+    // Runtime command channel: the host bumps IN_CMDSEQ after writing a console command at IN_CMDTEXT
+    // (e.g. handing music ownership to this seat when seat 0 quits). Run each new command once. Only
+    // benign cvar/exec commands are sent -- nothing that tears down the GL context/window.
+    if (g_addCmd) {
+        LONG seq = g_in[IN_CMDSEQ];
+        if (seq != g_cmdSeq) {
+            g_cmdSeq = seq;
+            char cmd[IN_CMDMAX];
+            memcpy(cmd, (const void*)(g_in + IN_CMDTEXT), IN_CMDMAX);
+            cmd[IN_CMDMAX - 1] = '\0';
+            if (cmd[0]) g_addCmd(cmd, 0);
+        }
+    }
 
     // GUI = a menu, OR the console while it's down/falling (C_Responder's own condition). When the
     // GUI is up it takes the keyboard, the mouse buttons (as clicks), and an absolute cursor;
     // otherwise input drives gameplay (look + binds). This is the same gating the native engine does.
     bool menuOpen = (g_menuActive && *g_menuActive != 0);
     int  cs = (g_consoleState ? *g_consoleState : 0);
-    bool guiOpen = menuOpen || cs == 1 || cs == 2;            // c_down | c_falling
+    // GUICapture = ZDoom GUI (menu/console/etc.); g_chatMode = Zandronum chat. Either means the keyboard
+    // belongs to a text UI. (menu+console reads kept as a belt-and-suspenders fallback.)
+    bool guiOpen = (g_guiCapture && *g_guiCapture != 0) || (g_chatMode && *g_chatMode != 0)
+                 || menuOpen || cs == 1 || cs == 2;
     if (guiOpen && !g_guiWas) { g_curX = g_vpW / 2; g_curY = g_vpH / 2; }   // recenter on open
     g_guiWas = guiOpen;
     g_in[IN_MENU] = guiOpen ? 1 : 0;   // publish to the host: this seat is in a menu OR the console --
@@ -371,7 +406,10 @@ DWORD WINAPI InitThread(LPVOID) {
     g_postEvent    = (PostEvent_t)(base + SS_RVA_D_PostEvent);
     g_menuActive   = (int*)(base + SS_RVA_menuactive);
     g_consoleState = (int*)(base + SS_RVA_ConsoleState);
+    g_guiCapture   = (unsigned char*)(base + SS_RVA_GUICapture);
+    g_chatMode     = (unsigned int*)(base + SS_RVA_g_ulChatMode);
     g_appActive    = (volatile int*)(base + SS_RVA_AppActive);
+    g_addCmd       = (AddCmd_t)(base + SS_RVA_AddCommandString);   // runtime console command channel
     g_invMouseY    = (getenv("SS_MOUSE_INVY") != nullptr);   // match the host so the GUI cursor tracks naturally
 
     // Hook I_GetAxes so the engine reads this seat's controller axes from shared memory -- native

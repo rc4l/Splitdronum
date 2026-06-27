@@ -59,6 +59,14 @@ TEST_CASE("TargetSize: passthrough, aspect caps, rounding, minimum") {
     TargetSize(Rect{0, 0, 100, 100}, w, h);  CHECK(w == 320);  CHECK(h == 200);   // below minimum -> clamped
 }
 
+TEST_CASE("SmartScale: per-seat-count render multiplier") {
+    CHECK(SmartScale(0) == 1.0f);    // degenerate (no seats yet) -> full
+    CHECK(SmartScale(1) == 1.0f);    // sole seat -> full
+    CHECK(SmartScale(2) == 0.75f);   // two up -> a touch lower
+    CHECK(SmartScale(3) == 0.5f);    // three/four -> half
+    CHECK(SmartScale(4) == 0.5f);
+}
+
 TEST_CASE("Rect equality operator") {
     CHECK(Rect{1, 2, 3, 4} == Rect{1, 2, 3, 4});
     CHECK_FALSE(Rect{1, 2, 3, 4} == Rect{0, 2, 3, 4});
