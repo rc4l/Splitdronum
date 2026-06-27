@@ -35,6 +35,6 @@ cmd /c "`"$vcvars`" >nul && cd /d `"$out`" && rc /nologo /fo host.res `"$rc`" &&
 
 if (Test-Path (Join-Path $out 'host.exe')) {
     # stage the Qt runtime (DLLs + QtQuick/QtQuick.Effects plugins) next to host.exe so it loads
-    & (Join-Path $qt 'bin\windeployqt.exe') --qmldir (Join-Path $root 'overlay\qml') --no-translations --no-compiler-runtime (Join-Path $out 'host.exe') *> $null
+    & (Join-Path $qt 'bin\windeployqt.exe') --release --qmldir (Join-Path $root 'overlay\qml') --no-translations --no-compiler-runtime (Join-Path $out 'host.exe') *> $null
 }
 Write-Host ("host.exe: " + (Test-Path (Join-Path $out 'host.exe')))

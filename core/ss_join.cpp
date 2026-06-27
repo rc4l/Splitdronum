@@ -22,42 +22,29 @@ JoinResult JoinAdvance(JoinState& s, const JoinInput& in) {
     if (s.pad < 0) return r;                                        // no active flow
     if (!in.connected || in.timedOut) { s.pad = -1; return r; }     // controller gone / idle timeout -> abort
     int nb = in.newButtons;
-    switch (s.step) {
-    case JS_PROMPT:                                                 // "press A to join"
-        if (nb & JB_CANCEL)       s.pad = -1;                       // B cancels
-        else if (nb & JB_CONFIRM) s.step = JS_WORD1;               // A/X/Y -> start building the name
-        break;
-    case JS_WORD1:                                                  // scroll the first name word
-        if (nb & JB_LEFT)  s.word1 = wrap(s.word1 - 1, in.word1Count);
-        if (nb & JB_RIGHT) s.word1 = wrap(s.word1 + 1, in.word1Count);
-        if (nb & JB_CANCEL)       s.pad = -1;                       // B from the first field aborts the join
-        else if (nb & JB_CONFIRM) s.step = JS_WORD2;
-        break;
-    case JS_WORD2:                                                  // scroll the second name word
-        if (nb & JB_LEFT)  s.word2 = wrap(s.word2 - 1, in.word2Count);
-        if (nb & JB_RIGHT) s.word2 = wrap(s.word2 + 1, in.word2Count);
-        if (nb & JB_CANCEL)       s.step = JS_WORD1;                // B backs up a step
-        else if (nb & JB_CONFIRM) s.step = JS_CROSSHAIR;
-        break;
-    case JS_CROSSHAIR:                                              // pick a crosshair
-        if (nb & JB_LEFT)  s.crosshair = wrap(s.crosshair - 1, in.crosshairCount);
-        if (nb & JB_RIGHT) s.crosshair = wrap(s.crosshair + 1, in.crosshairCount);
-        if (nb & JB_CANCEL)       s.step = JS_WORD2;
-        else if (nb & JB_CONFIRM) s.step = JS_MOTION;
-        break;
-    case JS_MOTION:                                                 // motion-sickness compensation on/off
-        if (nb & (JB_LEFT | JB_RIGHT)) s.motionComp = !s.motionComp;
-        if (nb & JB_CANCEL)       s.step = JS_CROSSHAIR;
-        else if (nb & JB_CONFIRM) {
-            if (!in.nameInUse) {                                    // create + join (host writes cfg, spawns)
-                r.action = JoinAction::Join; r.pad = s.pad;
-                r.word1 = s.word1; r.word2 = s.word2;
-                r.crosshair = s.crosshair; r.motionComp = s.motionComp;
-                s.pad = -1;                                         // flow ends
-            }
-            // else: name already loaded by another seat -> stay here (host shows "name taken")
+
+    if (nb & JB_UP)   s.field = (s.field + JF_COUNT - 1) % JF_COUNT;   // move focus
+    if (nb & JB_DOWN) s.field = (s.field + 1) % JF_COUNT;
+
+    int dir = (nb & JB_RIGHT) ? 1 : ((nb & JB_LEFT) ? -1 : 0);      // change the focused field
+    if (dir != 0) {
+        switch (s.field) {
+        case JF_WORD1:     s.word1 = wrap(s.word1 + dir, in.word1Count); break;
+        case JF_WORD2:     s.word2 = wrap(s.word2 + dir, in.word2Count); break;
+        case JF_CROSSHAIR: s.crosshair = wrap(s.crosshair + dir, in.crosshairCount); break;
+        default:           s.motion = (dir > 0) ? 1 : 0; break;     // JF_MOTION: right = on, left = off
         }
-        break;
+    }
+
+    if (nb & JB_CANCEL) s.pad = -1;                                 // B aborts
+    else if (nb & JB_CONFIRM) {
+        if (!in.nameInUse) {                                        // create + join (host writes cfg, spawns)
+            r.action = JoinAction::Join; r.pad = s.pad;
+            r.word1 = s.word1; r.word2 = s.word2;
+            r.crosshair = s.crosshair; r.motion = s.motion;
+            s.pad = -1;                                             // flow ends
+        }
+        // else: name already loaded by another seat -> stay (host shows "name taken")
     }
     return r;
 }

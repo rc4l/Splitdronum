@@ -16,8 +16,12 @@ bool Init(void* d3dDevice, void* d3dContext, const wchar_t* qmlFile);
 // Push state (render thread, between frames). screen = backbuffer size so pane px map correctly.
 void SetScreen(int w, int h);
 void SetSeat0Gone(int gone);
-// active=0 clears the join card; else the create-wizard state for the controller pane.
-void SetJoin(int active, int controller, int step, const char* word1, const char* word2,
+// Controller-unplugged seats this frame: for each, the seat index (color) + pane rect (backbuffer px).
+// count <= 4; seats[i] = seat index; paneXYWH[i*4 .. i*4+3] = x,y,w,h. count 0 clears them.
+void SetDisconnects(int count, const int* seats, const int* paneXYWH);
+// active=0 clears the panel; else the player-setup state (field = focused field) for the controller pane.
+// seat = the pane index (0-3) the player will occupy -- drives its per-seat accent color.
+void SetJoin(int active, int controller, int seat, int field, const char* word1, const char* word2,
              int crosshair, int motion, int taken, int paneX, int paneY, int paneW, int paneH);
 
 // Render the overlay into a w x h texture and return its ID3D11ShaderResourceView* (as void*), or null.

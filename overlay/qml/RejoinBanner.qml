@@ -1,7 +1,6 @@
 import QtQuick
-import QtQuick.Effects
 
-// "SEAT 0 LEFT — press [ENTER] to rejoin", the keyboard-player rejoin prompt. Pink neon glow + a keycap.
+// Clean rejoin prompt -- a dark pill with an amber ENTER key, no glow. Pixel font.
 Item {
     id: banner
     property var theme
@@ -11,32 +10,19 @@ Item {
     Rectangle {
         id: pill
         anchors.centerIn: parent
-        width: row.implicitWidth + 52
-        height: row.implicitHeight + 26
-        radius: 10
-        color: theme.bannerBg
-        border.width: 1.5
-        border.color: theme.pink
-        layer.enabled: true
-        layer.effect: MultiEffect { shadowEnabled: true; shadowColor: theme.pink; shadowBlur: 1.0; shadowOpacity: 0.8; blurMax: 56 }
+        width: row.implicitWidth + 48; height: row.implicitHeight + 22
+        radius: 12; color: theme.panel
+        border.width: 1; border.color: theme.border
 
         Row {
             id: row
             anchors.centerIn: parent
-            spacing: 10
-            Text {
-                anchors.verticalCenter: parent.verticalCenter; text: "SEAT 0 LEFT"
-                color: theme.pink; font { family: theme.fontUi; pixelSize: 18; bold: true; letterSpacing: 2 }
-            }
-            Text { anchors.verticalCenter: parent.verticalCenter; text: "—"; color: theme.textDim; font.pixelSize: 18 }
-            Text { anchors.verticalCenter: parent.verticalCenter; text: "press"; color: theme.text; font { family: theme.fontUi; pixelSize: 18 } }
-            Rectangle {                                   // ENTER keycap
-                anchors.verticalCenter: parent.verticalCenter
-                width: key.implicitWidth + 18; height: key.implicitHeight + 8
-                radius: 5; color: "transparent"; border.color: theme.cyan; border.width: 1.5
-                Text { id: key; anchors.centerIn: parent; text: "ENTER"; color: theme.cyan; font { family: theme.fontMono; pixelSize: 15; bold: true } }
-            }
-            Text { anchors.verticalCenter: parent.verticalCenter; text: "to rejoin"; color: theme.text; font { family: theme.fontUi; pixelSize: 18 } }
+            spacing: 12
+            Text { anchors.verticalCenter: parent.verticalCenter; text: "SEAT 0 LEFT"; color: theme.seatColors[0]; font { family: theme.fontUi; pixelSize: 26 } }
+            Text { anchors.verticalCenter: parent.verticalCenter; text: "press"; color: theme.text; font { family: theme.fontUi; pixelSize: 24 } }
+            Rectangle { anchors.verticalCenter: parent.verticalCenter; width: key.implicitWidth + 18; height: key.implicitHeight + 6; radius: 5; color: "#ffffff"
+                Text { id: key; anchors.centerIn: parent; text: "ENTER"; color: "#16181d"; font { family: theme.fontUi; pixelSize: 20 } } }
+            Text { anchors.verticalCenter: parent.verticalCenter; text: "to rejoin"; color: theme.text; font { family: theme.fontUi; pixelSize: 24 } }
         }
     }
 }

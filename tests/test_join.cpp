@@ -13,7 +13,7 @@ static JoinInput mk(int btn, int w1c = 16, int w2c = 16, int xc = 11, bool inUse
 TEST_CASE("JoinTryStart: opens only when free + Start + room") {
     JoinState s;
     CHECK(JoinTryStart(s, 2, true, true) == true);
-    CHECK(s.pad == 2); CHECK(s.step == JS_PROMPT); CHECK(s.word1 == 0);
+    CHECK(s.pad == 2); CHECK(s.field == 0); CHECK(s.word1 == 0);
     CHECK(JoinTryStart(s, 3, true, true) == false);     // already flowing
     JoinState a, b, c;
     CHECK(JoinTryStart(a, 0, false, true)  == false);   // no Start
@@ -32,51 +32,38 @@ TEST_CASE("JoinAdvance: idle + abort paths") {
     JoinAdvance(s, t); CHECK(s.pad == -1);              // idle timeout aborts
 }
 
-TEST_CASE("JoinAdvance: full create -> Join carries the chosen fields") {
+TEST_CASE("JoinAdvance: Up/Down move focus, wrapping") {
     JoinState s; JoinTryStart(s, 1, true, true);
-    JoinAdvance(s, mk(JB_CONFIRM)); CHECK(s.step == JS_WORD1);
-    JoinAdvance(s, mk(JB_RIGHT));   CHECK(s.word1 == 1);          // scroll word 1
-    JoinAdvance(s, mk(JB_RIGHT));   CHECK(s.word1 == 2);
-    JoinAdvance(s, mk(JB_LEFT));    CHECK(s.word1 == 1);
-    JoinAdvance(s, mk(JB_CONFIRM)); CHECK(s.step == JS_WORD2);
-    JoinAdvance(s, mk(JB_RIGHT));   CHECK(s.word2 == 1);          // scroll word 2
-    JoinAdvance(s, mk(JB_CONFIRM)); CHECK(s.step == JS_CROSSHAIR);
-    JoinAdvance(s, mk(JB_RIGHT));
-    JoinAdvance(s, mk(JB_RIGHT));   CHECK(s.crosshair == 2);      // pick crosshair
-    JoinAdvance(s, mk(JB_CONFIRM)); CHECK(s.step == JS_MOTION);
-    JoinAdvance(s, mk(JB_LEFT));    CHECK(s.motionComp == 1);     // motion comp on
+    JoinAdvance(s, mk(JB_UP));   CHECK(s.field == JF_MOTION);     // 0 - 1 wraps to last
+    JoinAdvance(s, mk(JB_DOWN)); CHECK(s.field == JF_WORD1);      // last + 1 wraps to 0
+    JoinAdvance(s, mk(JB_DOWN)); CHECK(s.field == JF_WORD2);
+    JoinAdvance(s, mk(JB_DOWN)); CHECK(s.field == JF_CROSSHAIR);
+}
+
+TEST_CASE("JoinAdvance: Left/Right change the focused field") {
+    JoinState s; JoinTryStart(s, 1, true, true);
+    JoinAdvance(s, mk(JB_RIGHT)); CHECK(s.word1 == 1);            // field 0 = word1
+    JoinAdvance(s, mk(JB_LEFT));  CHECK(s.word1 == 0);
+    JoinAdvance(s, mk(JB_LEFT));  CHECK(s.word1 == 15);          // wrap negative
+    s.field = JF_WORD2;     JoinAdvance(s, mk(JB_RIGHT)); CHECK(s.word2 == 1);
+    s.field = JF_CROSSHAIR; JoinAdvance(s, mk(JB_RIGHT)); CHECK(s.crosshair == 1);
+                            JoinAdvance(s, mk(JB_LEFT));  CHECK(s.crosshair == 0);
+    s.field = JF_MOTION;    JoinAdvance(s, mk(JB_RIGHT)); CHECK(s.motion == 1);   // right = on
+                            JoinAdvance(s, mk(JB_LEFT));  CHECK(s.motion == 0);   // left = off
+    s.field = JF_WORD1; s.word1 = 0; JoinAdvance(s, mk(JB_LEFT, 0)); CHECK(s.word1 == 0);   // empty list -> stays
+}
+
+TEST_CASE("JoinAdvance: Confirm creates (carrying fields); name-in-use blocks; Cancel aborts") {
+    JoinState s; JoinTryStart(s, 1, true, true);
+    s.word1 = 2; s.word2 = 5; s.crosshair = 3; s.motion = 1;
     JoinResult r = JoinAdvance(s, mk(JB_CONFIRM));
     CHECK(r.action == JoinAction::Join);
-    CHECK(r.pad == 1); CHECK(r.word1 == 1); CHECK(r.word2 == 1); CHECK(r.crosshair == 2); CHECK(r.motionComp == 1);
-    CHECK(s.pad == -1);                                           // flow ended
-}
+    CHECK(r.pad == 1); CHECK(r.word1 == 2); CHECK(r.word2 == 5); CHECK(r.crosshair == 3); CHECK(r.motion == 1);
+    CHECK(s.pad == -1);                                          // flow ended
 
-TEST_CASE("JoinAdvance: Cancel aborts from prompt/word1, backs up a step otherwise") {
-    JoinState s; JoinTryStart(s, 1, true, true);
-    JoinAdvance(s, mk(JB_CANCEL)); CHECK(s.pad == -1);            // prompt B -> abort
     JoinTryStart(s, 1, true, true);
-    JoinAdvance(s, mk(JB_CONFIRM));                               // -> WORD1
-    JoinAdvance(s, mk(JB_CANCEL)); CHECK(s.pad == -1);            // word1 B -> abort
-    JoinTryStart(s, 1, true, true);
-    s.step = JS_WORD2;     JoinAdvance(s, mk(JB_CANCEL)); CHECK(s.step == JS_WORD1);
-    s.step = JS_CROSSHAIR; JoinAdvance(s, mk(JB_CANCEL)); CHECK(s.step == JS_WORD2);
-    s.step = JS_MOTION;    JoinAdvance(s, mk(JB_CANCEL)); CHECK(s.step == JS_CROSSHAIR);
-}
-
-TEST_CASE("JoinAdvance: scroll wraps (negative + empty), motion toggles both ways") {
-    JoinState s; JoinTryStart(s, 1, true, true); s.step = JS_WORD1;
-    JoinAdvance(s, mk(JB_LEFT)); CHECK(s.word1 == 15);            // 0 - 1 wraps to count-1
-    s.word1 = 0; JoinAdvance(s, mk(JB_LEFT, 0)); CHECK(s.word1 == 0);   // empty list -> stays
-    s.step = JS_WORD2;     JoinAdvance(s, mk(JB_LEFT)); CHECK(s.word2 == 15);
-    s.step = JS_CROSSHAIR; JoinAdvance(s, mk(JB_LEFT)); CHECK(s.crosshair == 10);
-    s.step = JS_MOTION;
-    JoinAdvance(s, mk(JB_RIGHT)); CHECK(s.motionComp == 1);       // R toggles on
-    JoinAdvance(s, mk(JB_RIGHT)); CHECK(s.motionComp == 0);       // R toggles off
-}
-
-TEST_CASE("JoinAdvance: create blocked while that name is already loaded") {
-    JoinState s; JoinTryStart(s, 1, true, true); s.step = JS_MOTION;
-    JoinResult r = JoinAdvance(s, mk(JB_CONFIRM, 16, 16, 11, /*inUse*/ true));
-    CHECK(r.action == JoinAction::None);                         // name taken -> no join
-    CHECK(s.pad == 1);                                           // still on the screen
+    JoinResult r2 = JoinAdvance(s, mk(JB_CONFIRM, 16, 16, 11, /*inUse*/ true));
+    CHECK(r2.action == JoinAction::None);                       // name taken -> no join
+    CHECK(s.pad == 1);                                          // still on the panel
+    JoinAdvance(s, mk(JB_CANCEL)); CHECK(s.pad == -1);          // B aborts
 }

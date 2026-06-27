@@ -12,6 +12,7 @@
 #include <QQuickItem>
 #include <QSGRendererInterface>
 #include <QVariantMap>
+#include <QVariantList>
 #include <QUrl>
 #include <d3d11.h>
 
@@ -66,14 +67,25 @@ void ovl::SetSeat0Gone(int gone)
     if (g_root) g_root->setProperty("seat0Gone", gone != 0);
 }
 
-void ovl::SetJoin(int active, int controller, int step, const char* word1, const char* word2,
+void ovl::SetDisconnects(int count, const int* seats, const int* paneXYWH)
+{
+    if (!g_root) return;
+    QVariantList list;
+    for (int i = 0; i < count; ++i) {
+        QVariantMap pane{ {"x", paneXYWH[i*4+0]}, {"y", paneXYWH[i*4+1]}, {"w", paneXYWH[i*4+2]}, {"h", paneXYWH[i*4+3]} };
+        list.append(QVariantMap{ {"seat", seats[i]}, {"pane", pane} });
+    }
+    g_root->setProperty("disconnects", list);
+}
+
+void ovl::SetJoin(int active, int controller, int seat, int field, const char* word1, const char* word2,
                   int crosshair, int motion, int taken, int px, int py, int pw, int ph)
 {
     if (!g_root) return;
     if (!active) { g_root->setProperty("join", QVariant()); return; }
     QVariantMap pane{ {"x",px}, {"y",py}, {"w",pw}, {"h",ph} };
     g_root->setProperty("join", QVariantMap{
-        {"controller", controller}, {"step", step},
+        {"controller", controller}, {"seat", seat}, {"field", field},
         {"word1", QString::fromUtf8(word1)}, {"word2", QString::fromUtf8(word2)},
         {"crosshair", crosshair}, {"motion", motion != 0}, {"taken", taken != 0}, {"pane", pane} });
 }

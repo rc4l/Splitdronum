@@ -1,19 +1,18 @@
 import QtQuick
 
-// Standalone preview of the overlay over a stand-in "game" backdrop, with mock state -- so the UI can be
-// designed + screenshotted without the host. (The real host sets Overlay.join / seat0Gone instead.)
+// Standalone preview over a stand-in backdrop, with mock state -- design + screenshot without the host.
 Rectangle {
     width: 1280; height: 720
-    color: "#101a24"   // stand-in game background (the real overlay is transparent over the seats)
+    color: "#101a24"
 
     Overlay {
         anchors.fill: parent
         screenW: 1280; screenH: 720
         seat0Gone: true
         join: ({
-            controller: 1, step: 3, word1: "sneaky", word2: "revvy",
+            controller: 1, field: 2, word1: "happy", word2: "imp",
             crosshair: 3, motion: true, taken: false,
-            pane: { x: 640, y: 0, w: 640, h: 720 }
+            pane: { x: 0, y: 0, w: 1280, h: 720 }
         })
     }
 }

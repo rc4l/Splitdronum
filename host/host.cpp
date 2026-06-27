@@ -25,6 +25,7 @@
 #include "../core/ss_layout.h"
 #include "../core/ss_join.h"    // pure controller drop-in state machine (100%-tested; host owns the glue)
 #include "../core/ss_profile.h" // pure profile list + client launch-arg builder (100%-tested)
+#include "overlay_qt.h"          // Qt Quick cyberpunk overlay: renders qml/Overlay.qml -> a D3D11 texture
 
 // --- inject the DLL into a freshly-launched stock client, in two phases so the engine's main thread
 //     stays suspended until the DLL's window hooks are live (no startup-window flash). Splitting
@@ -96,7 +97,7 @@ static std::vector<Client> g_clients;
 static CRITICAL_SECTION    g_clientsLock;   // guards g_clients mutation (manager) vs read (render/main)
 // Create-and-join flow state, published by the manager thread for the render thread (DrawJoinPrompt):
 static volatile LONG       g_joinPad = -1;  // controller currently in the create flow (its XInput index), else -1
-static volatile LONG       g_joinStep = 0;  // ss::JoinStep: prompt / word1 / word2 / crosshair / motion-comp
+static volatile LONG       g_joinField = 0; // ss::JoinField: which field is focused (word1/word2/crosshair/motion)
 static volatile LONG       g_joinW1 = 0, g_joinW2 = 0;          // name word indices being scrolled
 static volatile LONG       g_joinCross = 0, g_joinMotion = 0;   // chosen crosshair value + motion-comp flag
 static volatile LONG       g_joinTaken = 0;                     // 1 = composed name already loaded (create blocked)
@@ -755,7 +756,9 @@ static DWORD WINAPI ManagerThread(LPVOID) {
                               | ((nb & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_X | XINPUT_GAMEPAD_Y)) ? ss::JB_CONFIRM : 0)
                               | ((nb & XINPUT_GAMEPAD_B) ? ss::JB_CANCEL : 0)
                               | ((nb & XINPUT_GAMEPAD_DPAD_LEFT)  ? ss::JB_LEFT  : 0)
-                              | ((nb & XINPUT_GAMEPAD_DPAD_RIGHT) ? ss::JB_RIGHT : 0);
+                              | ((nb & XINPUT_GAMEPAD_DPAD_RIGHT) ? ss::JB_RIGHT : 0)
+                              | ((nb & XINPUT_GAMEPAD_DPAD_UP)    ? ss::JB_UP    : 0)
+                              | ((nb & XINPUT_GAMEPAD_DPAD_DOWN)  ? ss::JB_DOWN  : 0);
                 in.connected      = ok;
                 in.timedOut       = (now > bannerUntil);
                 in.word1Count     = ss::ProfileWord1Count();
@@ -767,13 +770,13 @@ static DWORD WINAPI ManagerThread(LPVOID) {
                 ss::JoinResult r = ss::JoinAdvance(js, in);
                 if (r.action == ss::JoinAction::Join) {
                     char nm[64]; ss::ProfileComposeName(nm, sizeof(nm), r.word1, r.word2);
-                    WriteProfileCfg(nm, r.crosshair, r.motionComp);   // save profiles/<name>.cfg, then spawn it
+                    WriteProfileCfg(nm, r.crosshair, r.motion);   // save profiles/<name>.cfg, then spawn it
                     SpawnClient(r.pad, nm);
                 }
             }
             InterlockedExchange(&g_joinPad, js.pad);     // publish for the render thread (DrawJoinPrompt reads these)
-            g_joinStep = js.step; g_joinW1 = js.word1; g_joinW2 = js.word2;
-            g_joinCross = js.crosshair; g_joinMotion = js.motionComp; g_joinTaken = taken;
+            g_joinField = js.field; g_joinW1 = js.word1; g_joinW2 = js.word2;
+            g_joinCross = js.crosshair; g_joinMotion = js.motion; g_joinTaken = taken;
         }
         Sleep(8);
     }
@@ -795,17 +798,21 @@ static ID3D11VertexShader*  g_vs    = nullptr;
 static ID3D11PixelShader*   g_ps    = nullptr;
 static ID3D11SamplerState*  g_samp  = nullptr;
 static ID3D11RasterizerState* g_raster = nullptr;
+static ID3D11BlendState*    g_overlayBlend = nullptr;   // premultiplied-alpha blend for the Qt overlay
+static bool                 g_overlayOk = false;        // Qt overlay live? (else fall back to GDI cards)
+static ID3D11Buffer*        g_flipCb = nullptr;         // gFlipV: 1 = flip V (seats/GDI), 0 = no flip (Qt)
 static int g_swapW = 0, g_swapH = 0;
 struct GTex { ID3D11Texture2D* tex; ID3D11ShaderResourceView* srv; int w, h; };
 static GTex g_gtex[4] = { 0 };
 
 static const char* g_hlsl =
+"cbuffer C : register(b0) { float gFlipV; float3 pad; };\n"   // 1 = flip V (bottom-up seats/GDI), 0 = no flip (Qt)
 "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
 "VSOut VSMain(uint id : SV_VertexID) {\n"
 "  VSOut o;\n"
 "  float2 p = float2((id==1||id==3)?1.0:0.0, (id==2||id==3)?1.0:0.0);\n"
 "  o.pos = float4(p.x*2.0-1.0, 1.0-p.y*2.0, 0.0, 1.0);\n"
-"  o.uv  = float2(p.x, 1.0-p.y);\n"   // flip V: the glReadPixels framebuffer is bottom-up
+"  o.uv  = float2(p.x, gFlipV > 0.5 ? 1.0-p.y : p.y);\n"   // glReadPixels framebuffer is bottom-up; Qt is top-down
 "  return o;\n}\n"
 "Texture2D tx : register(t0); SamplerState sm : register(s0);\n"
 "float4 PSMain(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { return tx.Sample(sm, uv); }\n";
@@ -849,6 +856,16 @@ static bool InitD3D(HWND hwnd) {
     g_dev->CreateSamplerState(&smp, &g_samp);
     D3D11_RASTERIZER_DESC rd = { D3D11_FILL_SOLID, D3D11_CULL_NONE };
     g_dev->CreateRasterizerState(&rd, &g_raster);
+    D3D11_BUFFER_DESC cbd = {}; cbd.ByteWidth = 16; cbd.Usage = D3D11_USAGE_DEFAULT; cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    g_dev->CreateBuffer(&cbd, nullptr, &g_flipCb);   // gFlipV constant
+    D3D11_BLEND_DESC bd = {};                        // overlay composite: Qt outputs PREMULTIPLIED alpha
+    bd.RenderTarget[0].BlendEnable = TRUE;
+    bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;   bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE; bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    g_dev->CreateBlendState(&bd, &g_overlayBlend);
     // don't let DXGI hook the message-thread window (Alt+Enter etc.)
     IDXGIDevice* dxd = nullptr; IDXGIAdapter* ad = nullptr; IDXGIFactory* fac = nullptr;
     if (SUCCEEDED(g_dev->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxd))) {
@@ -873,9 +890,9 @@ static int g_promptN = -1, g_promptW = 0, g_promptH = 0;
 static void DrawJoinPrompt(ss::Rect area) {
     LONG jp = InterlockedCompareExchange(&g_joinPad, -1, -1);
     if (jp < 0) return;
-    int step = (int)g_joinStep, w1 = (int)g_joinW1, w2 = (int)g_joinW2;
+    int field = (int)g_joinField, w1 = (int)g_joinW1, w2 = (int)g_joinW2;
     int cross = (int)g_joinCross, motion = (int)g_joinMotion, taken = (int)g_joinTaken;
-    int key = ((((((int)jp * 8 + step) * 16 + w1) * 16 + w2) * 16 + cross) * 2 + motion) * 2 + taken;
+    int key = ((((((int)jp * 8 + field) * 16 + w1) * 16 + w2) * 16 + cross) * 2 + motion) * 2 + taken;
     if (key != g_promptN || !g_promptSrv) {
         g_promptN = key;
         if (g_promptSrv) { g_promptSrv->Release(); g_promptSrv = nullptr; }
@@ -900,19 +917,13 @@ static void DrawJoinPrompt(ss::Rect area) {
         SetTextColor(dc, RGB(236, 239, 250));
         RECT r1 = { 0, 14, TW, 52 }; DrawTextA(dc, l1, -1, &r1, DT_CENTER | DT_SINGLELINE);
         char nm[64]; ss::ProfileComposeName(nm, sizeof(nm), w1, w2);
-        char mid[160]; const char* hint = "dpad change      A  next      B  back";
-        if (step == ss::JS_PROMPT) {
-            _snprintf(mid, sizeof(mid), "press  A  to make a player");  hint = "B  cancel";
-        } else if (step == ss::JS_WORD1) {                // scrolling the first name word
-            _snprintf(mid, sizeof(mid), "<  %s  >%s", ss::ProfileWord1(w1), ss::ProfileWord2(w2));
-        } else if (step == ss::JS_WORD2) {                // scrolling the second name word
-            _snprintf(mid, sizeof(mid), "%s<  %s  >", ss::ProfileWord1(w1), ss::ProfileWord2(w2));
-        } else if (step == ss::JS_CROSSHAIR) {            // picking a crosshair
-            _snprintf(mid, sizeof(mid), "%s    crosshair <  %d  >", nm, cross);
-        } else {                                          // ss::JS_MOTION -- motion-sickness comp
-            _snprintf(mid, sizeof(mid), "%s    motion comp <  %s  >", nm, motion ? "ON" : "off");
-            hint = taken ? "name taken -- scroll to another      B  back" : "A  create + join      B  back";
-        }
+        char mid[160];
+        const char* hint = taken ? "name taken -- change it      A  create + join      B  back"
+                                  : "up/down select    left/right change    A  create + join    B  back";
+        if (field == ss::JF_WORD1)          _snprintf(mid, sizeof(mid), "<  %s  >%s", ss::ProfileWord1(w1), ss::ProfileWord2(w2));
+        else if (field == ss::JF_WORD2)     _snprintf(mid, sizeof(mid), "%s<  %s  >", ss::ProfileWord1(w1), ss::ProfileWord2(w2));
+        else if (field == ss::JF_CROSSHAIR) _snprintf(mid, sizeof(mid), "%s    crosshair <  %d  >", nm, cross);
+        else                                _snprintf(mid, sizeof(mid), "%s    motion comfort <  %s  >", nm, motion ? "ON" : "off");
         SelectObject(dc, fb); SetTextColor(dc, taken ? RGB(255, 140, 140) : RGB(150, 220, 255));
         RECT r2 = { 0, 56, TW, 106 }; DrawTextA(dc, mid, -1, &r2, DT_CENTER | DT_SINGLELINE);
         SelectObject(dc, fs); SetTextColor(dc, RGB(140, 150, 170));
@@ -956,11 +967,12 @@ static ID3D11ShaderResourceView* TextTexture(const char* msg, int* pw, int* ph) 
     HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
     HGDIOBJ ob = SelectObject(dc, bmp);
     RECT r = { 0, 0, TW, TH };
-    HBRUSH bg = CreateSolidBrush(RGB(34, 16, 16)); FillRect(dc, &r, bg); DeleteObject(bg);
+    HBRUSH bg = CreateSolidBrush(RGB(30, 33, 40)); FillRect(dc, &r, bg); DeleteObject(bg);    // Clean Console panel
+    HBRUSH bd = CreateSolidBrush(RGB(44, 48, 56)); FrameRect(dc, &r, bd); DeleteObject(bd);   // thin border
     SetBkMode(dc, TRANSPARENT);
-    HFONT f = CreateFontA(26, 0, 0, 0, FW_BOLD, 0, 0, 0, 0, 0, 0, ANTIALIASED_QUALITY, 0, "Segoe UI");
+    HFONT f = CreateFontA(16, 0, 0, 0, FW_NORMAL, 0, 0, 0, 0, 0, 0, NONANTIALIASED_QUALITY, 0, "VonwaonBitmap 16px");
     HGDIOBJ of = SelectObject(dc, f);
-    SetTextColor(dc, RGB(255, 198, 138));
+    SetTextColor(dc, RGB(255, 182, 72));   // amber accent (a warning -> draws the eye)
     DrawTextA(dc, msg, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     SelectObject(dc, of); DeleteObject(f);
     unsigned char* px = (unsigned char*)bits; for (int i = 0; i < TW * TH; ++i) px[i * 4 + 3] = 255;
@@ -974,6 +986,13 @@ static ID3D11ShaderResourceView* TextTexture(const char* msg, int* pw, int* ph) 
     if (g_textCount < 8 && srv) { TextEntry& e = g_textCache[g_textCount++]; _snprintf(e.msg, sizeof(e.msg), "%s", msg); e.tex = tex; e.srv = srv; e.w = TW; e.h = TH; }
     if (pw)*pw = TW; if (ph)*ph = TH;
     return srv;
+}
+
+// gFlipV: 1 = flip V (bottom-up GL seat framebuffers + GDI text), 0 = no flip (Qt's top-down texture).
+static void SetFlipV(float v) {
+    if (!g_flipCb) return;
+    float d[4] = { v, 0, 0, 0 };
+    g_ctx->UpdateSubresource(g_flipCb, 0, nullptr, d, 0, 0);
 }
 
 static void RenderD3D(HWND hwnd) {
@@ -991,6 +1010,8 @@ static void RenderD3D(HWND hwnd) {
     g_ctx->ClearRenderTargetView(g_rtv, black);
     g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr);
     g_ctx->VSSetShader(g_vs, nullptr, 0);
+    g_ctx->VSSetConstantBuffers(0, 1, &g_flipCb);
+    SetFlipV(1.0f);                  // seats + GDI text are bottom-up -> flip V
     g_ctx->PSSetShader(g_ps, nullptr, 0);
     g_ctx->PSSetSamplers(0, 1, &g_samp);
     g_ctx->RSSetState(g_raster);
@@ -1002,10 +1023,10 @@ static void RenderD3D(HWND hwnd) {
     // create card sits in its panel (seat 0 shrinks beside it) instead of overlapping the live seats. The
     // pane stays put when the seat actually spawns on the final confirm -> no layout jump, no overlap.
     int joinPad  = (int)InterlockedCompareExchange(&g_joinPad, -1, -1);
-    int joinStep = (int)g_joinStep;
-    int pending  = (joinPad >= 0 && joinStep >= ss::JS_WORD1 && live < 4) ? 1 : 0;
+    int pending  = (joinPad >= 0 && live < 4) ? 1 : 0;   // the panel reserves a pane the whole time it's up
     ss::Layout lay = ss::ComputeLayout(live + pending, W, H, ss::TwoMode::Auto);
     int pane = 0;
+    int discSeats[4], discPanes[16], discCount = 0;   // controller-unplugged seats -> Qt overlay disconnect cards
     for (size_t i = 0; i < g_clients.size() && i < 4; ++i) {
         if (!g_clients[i].alive || pane >= lay.count) continue;
         OpenFb(g_clients[i]);
@@ -1041,35 +1062,60 @@ static void RenderD3D(HWND hwnd) {
                 g_ctx->Draw(4, 0);
             }
         }
-        // controller unplugged -> status overlay on this seat's pane (reconnect resumes; hold Backspace to drop)
-        if (g_clients[i].pad >= 0 && g_clients[i].pad < 4 && !g_padConn[g_clients[i].pad]) {
-            char msg[112]; _snprintf(msg, sizeof(msg), "Player %d  -  controller disconnected   (hold Backspace to drop)", pane + 1);
-            int tw, th; ID3D11ShaderResourceView* osrv = TextTexture(msg, &tw, &th);
-            if (osrv) {
-                ss::Rect pn = lay.panes[pane];
-                int ow = tw, oh = th;
-                if (ow > pn.w - 16) { oh = (int)((long long)oh * (pn.w - 16) / ow); ow = pn.w - 16; }   // fit width
-                if (ow < 40) { ow = pn.w; oh = th; }
-                D3D11_VIEWPORT vp = { (float)(pn.x + (pn.w - ow) / 2), (float)(pn.y + (pn.h - oh) / 2), (float)ow, (float)oh, 0.0f, 1.0f };
-                g_ctx->RSSetViewports(1, &vp);
-                g_ctx->PSSetShaderResources(0, 1, &osrv);
-                g_ctx->Draw(4, 0);
-            }
+        // controller unplugged -> collect this seat for the Qt overlay's per-pane disconnect card
+        if (g_clients[i].pad >= 0 && g_clients[i].pad < 4 && !g_padConn[g_clients[i].pad] && discCount < 4) {
+            ss::Rect pn = lay.panes[pane];
+            discSeats[discCount] = pane;
+            discPanes[discCount * 4 + 0] = pn.x; discPanes[discCount * 4 + 1] = pn.y;
+            discPanes[discCount * 4 + 2] = pn.w; discPanes[discCount * 4 + 3] = pn.h;
+            discCount++;
         }
         pane++;   // an alive seat reserves its pane even before its first frame (stable tiling on join)
     }
     LeaveCriticalSection(&g_clientsLock);
-    // While customizing, draw the create card in the reserved pane (pane == live now); for the brief
-    // "press A" prompt (no reserved pane) center it over the whole window.
+    // The create card sits in its reserved pane (pane == live now); the brief prompt centers on the window.
     ss::Rect area = (pending && pane < lay.count) ? lay.panes[pane] : ss::Rect{ 0, 0, W, H };
-    DrawJoinPrompt(area);
-    if (!Seat0Alive()) {   // seat 0 (kbd/mouse) quit/crashed -- invite a keyboard rejoin (top-center banner)
-        int tw, th; ID3D11ShaderResourceView* s = TextTexture("seat 0 left  -  press Enter to rejoin", &tw, &th);
-        if (s) {
-            D3D11_VIEWPORT vp = { (float)((W - tw) / 2), 24.0f, (float)tw, (float)th, 0.0f, 1.0f };
+    if (g_overlayOk) {
+        // Qt Quick cyberpunk overlay: push state, render the QML into a texture on our device, then
+        // alpha-composite it full-window over the seats.
+        int jp = (int)InterlockedCompareExchange(&g_joinPad, -1, -1);
+        ovl::SetScreen(W, H);
+        ovl::SetSeat0Gone(Seat0Alive() ? 0 : 1);
+        ovl::SetDisconnects(discCount, discSeats, discPanes);
+        if (jp >= 0)
+            ovl::SetJoin(1, jp + 1, pane, (int)g_joinField, ss::ProfileWord1((int)g_joinW1), ss::ProfileWord2((int)g_joinW2),
+                         (int)g_joinCross, (int)g_joinMotion, (int)g_joinTaken, area.x, area.y, area.w, area.h);   // pane = the joining seat
+        else
+            ovl::SetJoin(0, 0, 0, 0, "", "", 0, 0, 0, 0, 0, 0, 0);
+        ID3D11ShaderResourceView* osrv = (ID3D11ShaderResourceView*)ovl::Render(W, H);
+        if (osrv) {                              // Qt clobbered the context -> re-bind our pipeline + blend
+            g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr);
+            g_ctx->VSSetShader(g_vs, nullptr, 0);
+            g_ctx->VSSetConstantBuffers(0, 1, &g_flipCb);
+            SetFlipV(0.0f);                      // Qt's texture is top-down -> no flip
+            g_ctx->PSSetShader(g_ps, nullptr, 0);
+            g_ctx->PSSetSamplers(0, 1, &g_samp);
+            g_ctx->RSSetState(g_raster);
+            g_ctx->IASetInputLayout(nullptr);
+            g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            float bf[4] = { 0, 0, 0, 0 };
+            g_ctx->OMSetBlendState(g_overlayBlend, bf, 0xffffffff);
+            D3D11_VIEWPORT vp = { 0.0f, 0.0f, (float)W, (float)H, 0.0f, 1.0f };
             g_ctx->RSSetViewports(1, &vp);
-            g_ctx->PSSetShaderResources(0, 1, &s);
+            g_ctx->PSSetShaderResources(0, 1, &osrv);
             g_ctx->Draw(4, 0);
+            g_ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+        }
+    } else {                                     // GDI fallback (Qt unavailable)
+        DrawJoinPrompt(area);
+        if (!Seat0Alive()) {
+            int tw, th; ID3D11ShaderResourceView* s = TextTexture("seat 0 left  -  press Enter to rejoin", &tw, &th);
+            if (s) {
+                D3D11_VIEWPORT vp = { (float)((W - tw) / 2), 24.0f, (float)tw, (float)th, 0.0f, 1.0f };
+                g_ctx->RSSetViewports(1, &vp);
+                g_ctx->PSSetShaderResources(0, 1, &s);
+                g_ctx->Draw(4, 0);
+            }
         }
     }
     // backbuffer dump for verification: set SS_CAPTURE, then drop a "capture.now" file in the cwd.
@@ -1107,6 +1153,14 @@ static DWORD WINAPI RenderThread(LPVOID) {
     double ftSum = 0, ftMax = 0; int ftN = 0, ftStutter = 0; DWORD ftT0 = timeGetTime();
     while (!g_hwnd) Sleep(5);
     bool d3d = InitD3D(g_hwnd);   // GPU compositor; transparently falls back to GDI if D3D is unavailable
+    if (d3d) {                    // the Qt overlay runs on THIS render thread (it owns the D3D device/context)
+        wchar_t exe[MAX_PATH]; GetModuleFileNameW(NULL, exe, MAX_PATH);
+        wchar_t* slash = wcsrchr(exe, L'\\'); if (slash) *slash = 0;
+        wchar_t font[MAX_PATH]; _snwprintf(font, MAX_PATH, L"%s\\..\\overlay\\qml\\fonts\\VonwaonBitmap-16px.ttf", exe);
+        AddFontResourceExW(font, FR_PRIVATE, NULL);   // pixel font for the GDI status cards (TextTexture)
+        wchar_t qml[MAX_PATH]; _snwprintf(qml, MAX_PATH, L"%s\\..\\overlay\\qml\\Overlay.qml", exe);
+        g_overlayOk = ovl::Init(g_dev, g_ctx, qml);   // false -> fall back to the GDI cards
+    }
     for (;;) {
         if (g_hwnd) {
             if (d3d) RenderD3D(g_hwnd); else Render(g_hwnd);
