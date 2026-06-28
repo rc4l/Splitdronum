@@ -596,12 +596,11 @@ static void DeployOneCfg(const char* src, const char* destName, const char* fall
     fclose(out);
 }
 static void DeploySeatCfg() {
-    // PREFERRED baseline -> splitseat.cfg (execed before the profile cfg, so profiles override it). Fallback
-    // keeps the music level the host's handoff re-exec relies on, in case the source file is missing.
-    DeployOneCfg(g_launch.seatsCfg, "splitseat.cfg", "snd_musicvolume 0.05\n");
+    // PREFERRED baseline -> splitseat.cfg (execed before the profile cfg, so profiles override it). No
+    // fallback: if the source is missing we write an empty file (the cfg ships with the repo).
+    DeployOneCfg(g_launch.seatsCfg, "splitseat.cfg", nullptr);
     // ABSOLUTE override -> splitseat_absolute.cfg (execed LAST, after the profile cfg, so it wins). Fallback
-    // is the ESSENTIAL controller-join binds (now an absolute), so a controller can always join even if the
-    // source file is missing. Always written, so the client's `+exec splitseat_absolute.cfg` never misses.
+    // is the ESSENTIAL controller-join binds, so a controller can always join even if the source is missing.
     DeployOneCfg(g_launch.absoluteCfg, "splitseat_absolute.cfg",
                  "bind pad_b \"ifspectator menu_join\"\nbind pad_x \"ifspectator menu_join\"\n");
 }
