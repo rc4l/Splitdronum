@@ -72,6 +72,7 @@
 #include "../core/ss_layout.h"
 #include "../core/ss_join.h"
 #include "../core/ss_profile.h"
+#include "../core/ss_input.h"
 #include "ss_shm.h"
 #include "ss_proc.h"
 
@@ -146,6 +147,10 @@ static int  g_joinPad = -1, g_joinField = 0, g_joinW1 = 0, g_joinW2 = 0, g_joinC
 static int  g_joinTaken = 0, g_joinKnown = 0, g_joinHold = 0, g_kbHold = 0, g_joinMode = 0, g_browseIndex = 0;
 static char g_joinVariant[64] = "";
 static ss::ProfileList g_profiles;            // saved configs the browser lists (refreshed on open)
+// Seat-0 keys/buttons the host has currently sent DOWN (held[sc] != 0). Lets the driver auto-release a key
+// that got stuck -- e.g. alt-tab (or cmd-tab on macOS) sends Alt-down (=+strafe) but focus leaves before
+// the Alt-up, leaving strafe held so mouse-X strafes instead of turning. Touched on the GUI thread only.
+static unsigned char g_seat0Down[0x200];
 
 static int LiveCount() { int n = 0; for (auto& c : g_clients) if (c.alive) ++n; return n; }
 static bool PadConnected(int p) { return p >= 0 && p < 4 && g_pads[p] != nullptr; }
@@ -811,8 +816,16 @@ static int QtKeyToGui(int key) {
         default: return 0;
     }
 }
+// Send a key/button UP to seat 0 (the kbd/mouse player). Used to auto-release stuck keys.
+static void Seat0KeyUp(int sc) {
+    std::lock_guard<std::mutex> lk(g_clientsLock);
+    if (!g_clients.empty() && g_clients[0].alive && g_clients[0].pad < 0) PushKey(g_clients[0], sc, 0, 0, 0);
+}
+
 // App-level filter: routes keyboard + mouse buttons to seat 0 (the kbd/mouse player), and tracks Enter
-// for keyboard hold-to-join. Look (relative mouse) is handled by the driver's cursor re-center.
+// for keyboard hold-to-join. Look (relative mouse) is handled by the driver's cursor re-center. Every key
+// it sends DOWN is recorded in g_heldVk so the driver can auto-release it if its physical key goes up
+// without a matching Qt release (alt-tab, focus loss) -- which is what caused the stuck-strafe bug.
 class InputFilter : public QObject {
     Q_OBJECT
 protected:
@@ -825,6 +838,7 @@ protected:
                 if (k->isAutoRepeat()) break;
                 int sc = QtKeyToDikExt(k->key()); if (!sc) sc = (int)(k->nativeScanCode() & 0xFF);
                 int gk = QtKeyToGui(k->key());
+                if (sc) g_seat0Down[sc & 0x1FF] = down ? 1 : 0;   // track for stuck-key auto-release
                 std::lock_guard<std::mutex> lk(g_clientsLock);
                 if (!g_clients.empty() && g_clients[0].alive && g_clients[0].pad < 0) {
                     if (sc || gk) PushKey(g_clients[0], sc, gk, 0, down ? 1 : 0);
@@ -835,11 +849,13 @@ protected:
             case QEvent::MouseButtonPress: case QEvent::MouseButtonRelease: {
                 if (g_mouseFreed) break;
                 QMouseEvent* m = static_cast<QMouseEvent*>(e);
+                bool down = (e->type() == QEvent::MouseButtonPress);
                 int code = (m->button() == Qt::LeftButton) ? 0x100 : (m->button() == Qt::RightButton) ? 0x101 : (m->button() == Qt::MiddleButton) ? 0x102 : 0;
                 if (code) {
+                    g_seat0Down[code & 0x1FF] = down ? 1 : 0;   // tracked so focus-loss releases it too
                     std::lock_guard<std::mutex> lk(g_clientsLock);
                     if (!g_clients.empty() && g_clients[0].alive && g_clients[0].pad < 0)
-                        PushKey(g_clients[0], code, 0, 0, e->type() == QEvent::MouseButtonPress ? 1 : 0);
+                        PushKey(g_clients[0], code, 0, 0, down ? 1 : 0);
                 }
                 break;
             }
@@ -982,6 +998,7 @@ int main(int argc, char** argv) {
     void* winHandle = nullptr;
 #endif
     bool lookPrimed = false;   // skip the first cursor delta after (re)gaining capture (avoids a jump)
+    bool wasActive  = true;    // track focus transitions to release seat-0 keys on focus loss
 
     // ~60 Hz driver (GUI thread): poll pads, feed gameplay, run the manager step (join/keyboard), reap,
     // music handoff, relative-mouse look, then re-tile + repaint.
@@ -1010,6 +1027,22 @@ int main(int argc, char** argv) {
             g_mouseFreed = seat0Menu || allMenu;
         }
         bool active = window.isActive();
+        // Auto-release stuck seat-0 modifiers (cross-platform): ask the OS for the real modifier state and
+        // release any modifier the host still holds that is no longer physically down. This self-heals the
+        // stuck-strafe bug (alt-tab / cmd-tab leaves Alt=+strafe held). On focus loss, release everything
+        // held (covers non-modifier keys lost across the switch). core/ss_input decides; it's unit-tested.
+        {
+            Qt::KeyboardModifiers mods = QGuiApplication::queryKeyboardModifiers();
+            int rel[8];
+            int n = ss::StuckModifierReleases(g_seat0Down, 0x200,
+                        (mods & Qt::AltModifier) != 0, (mods & Qt::ControlModifier) != 0, (mods & Qt::ShiftModifier) != 0,
+                        rel, 8);
+            for (int i = 0; i < n; ++i) { g_seat0Down[rel[i]] = 0; Seat0KeyUp(rel[i]); }
+        }
+        if (wasActive && !active)
+            for (int sc = 1; sc < 0x200; ++sc) if (g_seat0Down[sc]) { g_seat0Down[sc] = 0; Seat0KeyUp(sc); }
+        wasActive = active;
+
         bool capture = active && !g_mouseFreed && Seat0Alive();
         ClipCursorToWindow(winHandle, capture);
         if (capture) {

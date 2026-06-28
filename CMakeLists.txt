@@ -16,7 +16,8 @@ endif()
 add_library(ss_core STATIC
     core/ss_layout.cpp
     core/ss_join.cpp
-    core/ss_profile.cpp)
+    core/ss_profile.cpp
+    core/ss_input.cpp)
 target_include_directories(ss_core PUBLIC core)
 
 # --- tests: doctest (header-only, vendored), cross-platform; run via ctest ---
@@ -24,7 +25,8 @@ enable_testing()
 add_executable(ss_tests
     tests/test_layout.cpp
     tests/test_join.cpp
-    tests/test_profile.cpp)
+    tests/test_profile.cpp
+    tests/test_input.cpp)
 target_link_libraries(ss_tests PRIVATE ss_core)
 target_include_directories(ss_tests PRIVATE third_party)
 add_test(NAME ss_tests COMMAND ss_tests)
