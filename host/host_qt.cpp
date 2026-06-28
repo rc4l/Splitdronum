@@ -50,6 +50,15 @@
 #include <QMouseEvent>
 #include <QCursor>
 #include <QPoint>
+#include <QQmlEngine>
+#include <QQmlComponent>
+#include <QUrl>
+#include <QVariant>
+#include <QVariantMap>
+#include <QVariantList>
+#include <QFileInfo>
+#include <QStringList>
+#include <QCoreApplication>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -130,6 +139,7 @@ static bool g_invMouseY = false, g_invPadY = false, g_invPadX = false;   // opti
 static SDL_GameController* g_pads[4] = { nullptr, nullptr, nullptr, nullptr };   // open pads by slot 0..3
 static bool g_mouseFreed = false;             // a menu is up -> stop feeding seat 0 look, free the cursor
 static bool g_enterDown = false;              // Enter currently held (keyboard hold-to-join), via Qt events
+static bool g_kbmEverUp = false;              // a kbd/mouse seat 0 has existed (gate the "seat 0 left" prompt)
 
 // Create-and-join flow state, published by the manager step for the overlay (all touched on the GUI thread).
 static int  g_joinPad = -1, g_joinField = 0, g_joinW1 = 0, g_joinW2 = 0, g_joinCross = 0, g_joinMotion = 0;
@@ -464,6 +474,7 @@ static bool SpawnClient(int pad, const char* profile) {
         g_clients[slot] = c;
     }
     ++g_launchN;
+    if (pad < 0) g_kbmEverUp = true;   // the kbd/mouse seat has now existed -> rejoin prompt allowed
     return true;
 }
 
@@ -778,6 +789,68 @@ protected:
     }
 };
 
+// --- the QML overlay (the existing qml/Overlay.qml, loaded straight into the scene) ----------------
+// No D3D11/Metal interop: the overlay is just another item in the same Qt Quick scene, drawn above the
+// seats (z=100). Its root properties are pushed each tick exactly as the old overlay_qt.cpp did.
+static QQuickItem* g_overlay = nullptr;
+static QQmlEngine* g_qmlEngine = nullptr;
+
+static QString FindOverlayQml() {
+    QString dir = QCoreApplication::applicationDirPath();
+    QStringList cands;
+    if (const char* env = getenv("SS_OVERLAY_QML")) cands << QString::fromUtf8(env);
+    cands << dir + "/../overlay/qml/Overlay.qml"        // dev / build layout (host in build/)
+          << dir + "/overlay/qml/Overlay.qml"           // packaged layout (overlay beside the binary)
+          << dir + "/../Resources/overlay/qml/Overlay.qml";  // macOS .app bundle layout
+    for (const QString& c : cands) if (QFileInfo::exists(c)) return c;
+    return QString();
+}
+static bool InitOverlay(QQuickWindow& window) {
+    QString path = FindOverlayQml();
+    if (path.isEmpty()) { qWarning("overlay: Overlay.qml not found (set SS_OVERLAY_QML)"); return false; }
+    g_qmlEngine = new QQmlEngine();
+    QQmlComponent comp(g_qmlEngine, QUrl::fromLocalFile(path));
+    QObject* obj = comp.create();
+    if (!obj) { qWarning("overlay QML error: %s", comp.errorString().toUtf8().constData()); return false; }
+    g_overlay = qobject_cast<QQuickItem*>(obj);
+    if (!g_overlay) { delete obj; return false; }
+    g_overlay->setParentItem(window.contentItem());
+    g_overlay->setZ(100);   // always above the seat items
+    return true;
+}
+// Push the host's published state onto the overlay's QML root properties (GUI thread).
+static void UpdateOverlay(int W, int H, const ss::Rect& joinArea, int joinSeatPane, const QVariantList& disconnects) {
+    if (!g_overlay) return;
+    g_overlay->setWidth(W); g_overlay->setHeight(H);
+    g_overlay->setProperty("screenW", W);
+    g_overlay->setProperty("screenH", H);
+    g_overlay->setProperty("seat0Gone", g_kbmEverUp && !Seat0Alive());
+    g_overlay->setProperty("waitStart", !g_autoStart && g_launchN == 0);
+    g_overlay->setProperty("kbHold", g_kbHold / 1000.0);
+    g_overlay->setProperty("disconnects", disconnects);
+
+    if (g_joinPad >= 0) {
+        QVariantMap pane{ {"x", joinArea.x}, {"y", joinArea.y}, {"w", joinArea.w}, {"h", joinArea.h} };
+        g_overlay->setProperty("join", QVariantMap{
+            {"controller", g_joinPad + 1}, {"seat", joinSeatPane}, {"field", g_joinField},
+            {"word1", QString::fromUtf8(ss::ProfileWord1(g_joinW1))}, {"word2", QString::fromUtf8(ss::ProfileWord2(g_joinW2))},
+            {"crosshair", g_joinCross}, {"motion", g_joinMotion != 0}, {"taken", g_joinTaken != 0}, {"known", g_joinKnown != 0},
+            {"hold", g_joinHold / 1000.0}, {"mode", g_joinMode}, {"variant", QString::fromUtf8(g_joinVariant)},
+            {"pane", pane} });
+    } else {
+        g_overlay->setProperty("join", QVariant());
+    }
+
+    if (g_joinPad >= 0 && g_joinMode == ss::JM_BROWSE) {
+        QVariantList items;
+        for (int i = 0; i < g_profiles.count; ++i)
+            items.append(QVariantMap{ {"name", QString::fromUtf8(g_profiles.names[i])}, {"taken", NameInUse(g_profiles.names[i])} });
+        g_overlay->setProperty("browse", QVariantMap{ {"index", g_browseIndex}, {"items", items} });
+    } else {
+        g_overlay->setProperty("browse", QVariant());
+    }
+}
+
 static void ParseEnv() {
     g_invMouseY = getenv("SS_MOUSE_INVY") != nullptr;
     g_invPadY   = getenv("SS_PAD_INVY")   != nullptr;
@@ -829,6 +902,7 @@ int main(int argc, char** argv) {
     QQuickItem* root = window.contentItem();
     SeatItem* seats[4];
     for (int i = 0; i < 4; ++i) { seats[i] = new SeatItem(root); seats[i]->setSeat(i); seats[i]->setVisible(false); }
+    InitOverlay(window);   // load qml/Overlay.qml on top of the seats (optional -- host runs without it)
     window.show();
 
     // ~60 Hz driver (GUI thread): poll pads, feed gameplay, run the manager step (join/keyboard), reap,
@@ -870,14 +944,29 @@ int main(int argc, char** argv) {
 
         int W = (int)window.width(), H = (int)window.height();
         ss::Rect paneFor[4]; bool show[4] = { false, false, false, false };
+        ss::Rect joinArea{ 0, 0, W, H }; int joinSeatPane = 0;
+        QVariantList disconnects;
         {
             std::lock_guard<std::mutex> lk(g_clientsLock);
-            ss::Layout lay = ss::ComputeLayout(LiveCount(), W, H, ss::TwoMode::Auto);
+            int live = LiveCount();
+            // a controller customizing reserves its OWN pane (live+pending) so its card doesn't overlap seats
+            int pending = (g_joinPad >= 0 && live < 4) ? 1 : 0;
+            ss::Layout lay = ss::ComputeLayout(live + pending, W, H, ss::TwoMode::Auto);
             int pane = 0;
             for (int i = 0; i < 4; ++i) {
                 bool alive = i < (int)g_clients.size() && g_clients[i].alive;
-                if (alive && pane < lay.count) { paneFor[i] = lay.panes[pane++]; show[i] = true; }
+                if (alive && pane < lay.count) {
+                    paneFor[i] = lay.panes[pane]; show[i] = true;
+                    if (g_clients[i].pad >= 0 && g_clients[i].pad < 4 && !PadConnected(g_clients[i].pad)) {
+                        ss::Rect pn = lay.panes[pane];
+                        disconnects.append(QVariantMap{ {"seat", pane},
+                            {"pane", QVariantMap{ {"x", pn.x}, {"y", pn.y}, {"w", pn.w}, {"h", pn.h} }} });
+                    }
+                    pane++;
+                }
             }
+            joinSeatPane = pane;
+            joinArea = (pending && pane < lay.count) ? lay.panes[pane] : ss::Rect{ 0, 0, W, H };
         }
         for (int i = 0; i < 4; ++i) {
             seats[i]->setVisible(show[i]);
@@ -887,6 +976,7 @@ int main(int argc, char** argv) {
                 seats[i]->update();
             }
         }
+        UpdateOverlay(W, H, joinArea, joinSeatPane, disconnects);
     });
     driver.start(16);
 
