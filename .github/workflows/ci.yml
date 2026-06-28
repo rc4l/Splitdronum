@@ -12,22 +12,32 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-13]
+        os: [windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-
-      # Qt 6.8 still references Apple's AGL framework, which newer macOS SDKs removed. Use an Xcode whose
-      # SDK (macOS 13.x) still ships AGL so the Qt app links. macos-13 is Intel (runs under Rosetta on ARM).
-      - name: Select Xcode (macOS)
-        if: runner.os == 'macOS'
-        run: sudo xcode-select -s /Applications/Xcode_14.3.1.app
 
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
         with:
           version: '6.8.1'
           cache: true
+
+      # Qt 6.8's CMake config lists Apple's AGL framework (removed from current macOS SDKs) in its link
+      # interface, although the Qt libraries don't use it at runtime -- which is why Qt apps still run on
+      # modern macOS. Strip the stale reference so the app links natively on macos-latest (Apple Silicon),
+      # instead of pinning to an old SDK whose AGL-linked binary wouldn't launch on a current Mac.
+      - name: Strip stale AGL ref from Qt (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -e
+          echo "Qt root: $QT_ROOT_DIR"
+          files=$(grep -rl "AGL" "$QT_ROOT_DIR/lib/cmake" || true)
+          echo "files referencing AGL:"; echo "$files"
+          for f in $files; do
+            sed -i '' -E 's/\$<LINK_ONLY:AGL>//g; s/(^|[";: ])AGL([";: ]|$)/\1\2/g' "$f"
+          done
+          echo "remaining AGL refs:"; grep -rn "AGL" "$QT_ROOT_DIR/lib/cmake" || echo "(none)"
 
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSS_BUILD_LAUNCHER=ON
