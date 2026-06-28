@@ -1,40 +1,42 @@
-# Build the splitscreen compositor (host.exe): host/host.cpp + core modules + the Qt Quick overlay
-# (host/overlay_qt.cpp), linked against user32/gdi32/d3d + Qt6. Portable: discovers the VS2022 x64
-# toolchain via vswhere and Qt under deps/qt. windeployqt stages the Qt runtime next to host.exe.
+# Build the cross-platform Qt host/compositor (host.exe): host/host_qt.cpp built via the root CMake
+# project (-DSS_BUILD_HOST=ON), which also fetches + builds SDL2 (static, gamepads only) and links Qt6.
+# Qt Quick is the compositor: it draws the seat framebuffers AND the QML overlay in one scene on Qt's RHI
+# (D3D11 here). This is the convergence default; the legacy Win32/D3D11 host is build-host-legacy.ps1.
+# Output: build\host.exe + the Qt runtime staged beside it. Discovers CMake (PATH, else VS's bundled one)
+# and Qt under deps\qt.
 $ErrorActionPreference = 'Continue'
 $root = $PSScriptRoot
 $out  = Join-Path $root 'build'
 New-Item -ItemType Directory -Force $out | Out-Null
 
-$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-if (-not (Test-Path $vswhere)) { Write-Host 'ERROR: Visual Studio not found.'; exit 2 }
-$vsroot = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-$vcvars = Join-Path $vsroot 'VC\Auxiliary\Build\vcvars64.bat'
-
-# Qt (fetched by aqtinstall to deps/qt -- see README). Resolve the version dir so a Qt bump just works.
 $qtBase = Join-Path $root 'deps\qt'
 $qtVer  = (Get-ChildItem $qtBase -Directory -EA SilentlyContinue | Where-Object { $_.Name -match '^6\.' } | Select-Object -First 1).Name
 $qt     = Join-Path $qtBase "$qtVer\msvc2022_64"
 if (-not (Test-Path (Join-Path $qt 'bin\windeployqt.exe'))) { Write-Host "ERROR: Qt not found under $qtBase (run aqtinstall -- see README)."; exit 3 }
-$qtInc  = Join-Path $qt 'include'
-$qtLib  = Join-Path $qt 'lib'
 
-$hostcpp = Join-Path $root 'host\host.cpp'
-$layout  = Join-Path $root 'core\ss_layout.cpp'
-$join    = Join-Path $root 'core\ss_join.cpp'
-$profile = Join-Path $root 'core\ss_profile.cpp'
-$overlay = Join-Path $root 'host\overlay_qt.cpp'
-$rc      = Join-Path $root 'host\host.rc'        # app icon resource -> host.res, linked into host.exe
-
-$qtI = "/I `"$qtInc`" /I `"$qtInc\QtCore`" /I `"$qtInc\QtGui`" /I `"$qtInc\QtQml`" /I `"$qtInc\QtQuick`""
-$qtL = "`"$qtLib\Qt6Core.lib`" `"$qtLib\Qt6Gui.lib`" `"$qtLib\Qt6Qml.lib`" `"$qtLib\Qt6Quick.lib`""
-
-# overlay_qt.cpp needs Qt's required /permissive- (strict conformance); compile it to an .obj on its own
-# so host.cpp keeps its relaxed flags, then link everything together.
-cmd /c "`"$vcvars`" >nul && cd /d `"$out`" && rc /nologo /fo host.res `"$rc`" && cl /c /nologo /O2 /EHsc /std:c++17 /Zc:__cplusplus /permissive- $qtI `"$overlay`" && cl /nologo /O2 /EHsc /Fe:host.exe `"$hostcpp`" `"$layout`" `"$join`" `"$profile`" overlay_qt.obj host.res user32.lib gdi32.lib winmm.lib dwmapi.lib d3d11.lib dxgi.lib d3dcompiler.lib ws2_32.lib $qtL"
-
-if (Test-Path (Join-Path $out 'host.exe')) {
-    # stage the Qt runtime (DLLs + QtQuick/QtQuick.Effects plugins) next to host.exe so it loads
-    & (Join-Path $qt 'bin\windeployqt.exe') --release --qmldir (Join-Path $root 'overlay\qml') --no-translations --no-compiler-runtime (Join-Path $out 'host.exe') *> $null
+$cmake = (Get-Command cmake -ErrorAction SilentlyContinue).Source
+if (-not $cmake) {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path $vswhere) {
+        $vsroot  = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        $bundled = Join-Path $vsroot 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
+        if (Test-Path $bundled) { $cmake = $bundled }
+    }
 }
-Write-Host ("host.exe: " + (Test-Path (Join-Path $out 'host.exe')))
+if (-not $cmake -or -not (Test-Path $cmake)) { Write-Host 'ERROR: CMake not found (install it, or the "C++ CMake tools for Windows" VS component).'; exit 2 }
+
+$bld = Join-Path $out 'host-cmake'   # under build\ (gitignored)
+& $cmake -S $root -B $bld -G 'Visual Studio 17 2022' -A x64 "-DCMAKE_PREFIX_PATH=$qt" -DSS_BUILD_HOST=ON -DSS_BUILD_LAUNCHER=OFF
+if ($LASTEXITCODE -ne 0) { Write-Host 'ERROR: CMake configure failed.'; exit 3 }
+& $cmake --build $bld --config Release --target sshost
+if ($LASTEXITCODE -ne 0) { Write-Host 'ERROR: build failed.'; exit 3 }
+
+# Stage host.exe (named "host" by the target) into build\ next to ss_hook.dll, then deploy the Qt runtime
+# (DLLs + QtQuick plugins). The host finds qml/Overlay.qml at ..\overlay\qml relative to build\host.exe.
+$built = Join-Path $bld 'Release\host.exe'
+$exe   = Join-Path $out 'host.exe'
+if (Test-Path $built) {
+    Copy-Item $built $exe -Force
+    & (Join-Path $qt 'bin\windeployqt.exe') --release --qmldir (Join-Path $root 'overlay\qml') --no-translations --no-compiler-runtime $exe *> $null
+}
+Write-Host ("host.exe (Qt): " + (Test-Path $exe))

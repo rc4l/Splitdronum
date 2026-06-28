@@ -558,6 +558,67 @@ static void UpdateMusicOwner() {
     }
 }
 
+// --- Windows desktop guards (no-ops elsewhere) --------------------------------------------------
+// Parity with the legacy Win32 host: restore the desktop gamma the engine clobbers, keep the stock
+// clients' own windows hidden (the DLL hides them at create; this is the per-frame catch), and reclaim
+// foreground from any child window that steals it during the staggered startup.
+#ifdef _WIN32
+static WORD g_origGamma[768];
+static bool g_gammaSaved = false;
+static void SaveGamma() {
+    HDC dc = GetDC(NULL);
+    if (dc) { g_gammaSaved = !!GetDeviceGammaRamp(dc, g_origGamma); ReleaseDC(NULL, dc); }
+}
+static void RestoreGamma() {
+    if (!g_gammaSaved) return;
+    HDC dc = GetDC(NULL);
+    if (dc) { SetDeviceGammaRamp(dc, g_origGamma); ReleaseDC(NULL, dc); }
+}
+static BOOL CALLBACK HideEnum_(HWND h, LPARAM lp) {
+    DWORD pid = 0; GetWindowThreadProcessId(h, &pid);
+    auto* pids = (std::vector<DWORD>*)lp;
+    for (DWORD p : *pids) if (p == pid && IsWindowVisible(h)) { ShowWindow(h, SW_HIDE); break; }
+    return TRUE;
+}
+static void HideChildWindows() {
+    std::vector<DWORD> pids;
+    if (g_serverPid) pids.push_back(g_serverPid);
+    { std::lock_guard<std::mutex> lk(g_clientsLock); for (auto& c : g_clients) if (c.pid) pids.push_back((DWORD)c.pid); }
+    if (!pids.empty()) EnumWindows(HideEnum_, (LPARAM)&pids);
+}
+static void ForceForeground(HWND hwnd) {
+    HWND fg = GetForegroundWindow();
+    DWORD myTid = GetCurrentThreadId();
+    DWORD fgTid = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
+    if (fgTid && fgTid != myTid) AttachThreadInput(myTid, fgTid, TRUE);
+    BringWindowToTop(hwnd); SetForegroundWindow(hwnd); SetActiveWindow(hwnd); SetFocus(hwnd);
+    if (fgTid && fgTid != myTid) AttachThreadInput(myTid, fgTid, FALSE);
+}
+// If a hidden child window grabbed the foreground (startup race), take it back so seat-0 input flows.
+static void ReclaimForeground(HWND hwnd) {
+    HWND fg = GetForegroundWindow();
+    if (fg == hwnd) return;
+    DWORD fgPid = 0; if (fg) GetWindowThreadProcessId(fg, &fgPid);
+    bool childFg = (fgPid && fgPid == g_serverPid);
+    if (!childFg) { std::lock_guard<std::mutex> lk(g_clientsLock); for (auto& c : g_clients) if (c.pid == fgPid) { childFg = true; break; } }
+    if (childFg) ForceForeground(hwnd);
+}
+static void ClipCursorToWindow(HWND hwnd, bool on) {
+    if (!on) { ClipCursor(NULL); return; }
+    RECT cr; GetClientRect(hwnd, &cr);
+    POINT a = { cr.left, cr.top }, b = { cr.right, cr.bottom };
+    ClientToScreen(hwnd, &a); ClientToScreen(hwnd, &b);
+    RECT clip = { a.x, a.y, b.x, b.y };
+    ClipCursor(&clip);
+}
+#else
+static void SaveGamma() {}
+static void RestoreGamma() {}
+static void HideChildWindows() {}
+static void ReclaimForeground(void*) {}
+static void ClipCursorToWindow(void*, bool) {}
+#endif
+
 // --- manager step: keyboard hold-to-join, pad reconnect, and the controller join state machine -----
 // Runs each driver tick on the GUI thread (SDL pad state is refreshed there). The pure ss_join state
 // machine decides transitions; this owns the side effects (enqueue spawn, write profile cfg, recall).
@@ -887,7 +948,10 @@ int main(int argc, char** argv) {
         g_screenH = (int)(sc->geometry().height() * dpr);
     }
 
-    DeploySeatCfg();   // write splitseat.cfg + splitseat_absolute.cfg into the gamedir before any client
+    SaveGamma();        // snapshot the desktop gamma BEFORE any client can change it
+    atexit(RestoreGamma);
+
+    DeploySeatCfg();    // write splitseat.cfg + splitseat_absolute.cfg into the gamedir before any client
 
     std::thread worker(WorkerMain);   // server bring-up + spawns run here (off the GUI loop)
 
@@ -904,6 +968,14 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 4; ++i) { seats[i] = new SeatItem(root); seats[i]->setSeat(i); seats[i]->setVisible(false); }
     InitOverlay(window);   // load qml/Overlay.qml on top of the seats (optional -- host runs without it)
     window.show();
+    window.requestActivate();
+#ifdef _WIN32
+    HWND winHandle = (HWND)window.winId();
+    ForceForeground(winHandle);
+#else
+    void* winHandle = nullptr;
+#endif
+    bool lookPrimed = false;   // skip the first cursor delta after (re)gaining capture (avoids a jump)
 
     // ~60 Hz driver (GUI thread): poll pads, feed gameplay, run the manager step (join/keyboard), reap,
     // music handoff, relative-mouse look, then re-tile + repaint.
@@ -919,6 +991,8 @@ int main(int argc, char** argv) {
         ManagerStep();
         ReapDeadSeats();
         UpdateMusicOwner();
+        HideChildWindows();            // keep the stock clients' own windows hidden (Win)
+        ReclaimForeground(winHandle);  // take focus back from a child that grabbed it (Win)
 
         // free the mouse when seat 0 is in a menu/console, or when every live seat is (nobody playing);
         // otherwise capture it for seat-0 look by re-centering the cursor and feeding the delta.
@@ -930,16 +1004,23 @@ int main(int argc, char** argv) {
             g_mouseFreed = seat0Menu || allMenu;
         }
         bool active = window.isActive();
-        if (active && !g_mouseFreed && Seat0Alive()) {
+        bool capture = active && !g_mouseFreed && Seat0Alive();
+        ClipCursorToWindow(winHandle, capture);
+        if (capture) {
             QPoint center(window.x() + (int)window.width() / 2, window.y() + (int)window.height() / 2);
-            QPoint cur = QCursor::pos();
-            int dx = cur.x() - center.x(), dy = cur.y() - center.y();
-            if (dx || dy) {
-                std::lock_guard<std::mutex> lk(g_clientsLock);
-                if (!g_clients.empty() && g_clients[0].alive && g_clients[0].pad < 0)
-                    PushMouse(g_clients[0], dx, g_invMouseY ? dy : -dy);
-                QCursor::setPos(center);
+            if (!lookPrimed) { QCursor::setPos(center); lookPrimed = true; }   // arm without a jump
+            else {
+                QPoint cur = QCursor::pos();
+                int dx = cur.x() - center.x(), dy = cur.y() - center.y();
+                if (dx || dy) {
+                    std::lock_guard<std::mutex> lk(g_clientsLock);
+                    if (!g_clients.empty() && g_clients[0].alive && g_clients[0].pad < 0)
+                        PushMouse(g_clients[0], dx, g_invMouseY ? dy : -dy);
+                    QCursor::setPos(center);
+                }
             }
+        } else {
+            lookPrimed = false;
         }
 
         int W = (int)window.width(), H = (int)window.height();
@@ -991,6 +1072,8 @@ int main(int argc, char** argv) {
         for (auto& c : g_clients) UnmapSeat(c);
     }
     if (g_serverPid) ss::ProcKillGraceful(g_serverPid);
+    ClipCursorToWindow(winHandle, false);   // release the cursor
+    RestoreGamma();                          // put the desktop gamma back (engine clobbers it)
     for (int p = 0; p < 4; ++p) if (g_pads[p]) SDL_GameControllerClose(g_pads[p]);
     SDL_Quit();
 #ifdef _WIN32
