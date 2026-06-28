@@ -23,24 +23,20 @@ jobs:
           version: '6.8.1'
           cache: true
 
-      # Qt 6.8's CMake config lists Apple's AGL framework (removed from current macOS SDKs) in its link
-      # interface, although the Qt libraries don't use it at runtime -- which is why Qt apps still run on
-      # modern macOS. Strip the stale reference so the app links natively on macos-latest (Apple Silicon),
-      # instead of pinning to an old SDK whose AGL-linked binary wouldn't launch on a current Mac.
-      - name: Strip stale AGL ref from Qt (macOS)
+      # Qt 6.8's WrapOpenGL find-module links Apple's AGL framework, which current macOS SDKs no longer
+      # ship as a real binary (so the link errors out). Qt Quick uses Metal on macOS and doesn't need it,
+      # so neutralize the AGL lookup -- the app then links and runs on modern macOS.
+      - name: Neutralize Qt AGL OpenGL link (macOS)
         if: runner.os == 'macOS'
         run: |
-          set -e
-          echo "Qt root: $QT_ROOT_DIR"
-          files=$(grep -rl "AGL" "$QT_ROOT_DIR/lib/cmake" || true)
-          echo "files referencing AGL:"; echo "$files"
-          for f in $files; do
-            sed -i '' -E 's/\$<LINK_ONLY:AGL>//g; s/(^|[";: ])AGL([";: ]|$)/\1\2/g' "$f"
-          done
-          echo "remaining AGL refs:"; grep -rn "AGL" "$QT_ROOT_DIR/lib/cmake" || echo "(none)"
+          f="$QT_ROOT_DIR/lib/cmake/Qt6/FindWrapOpenGL.cmake"
+          sed -i '' 's/find_library(WrapOpenGL_AGL NAMES AGL)/set(WrapOpenGL_AGL "")/' "$f"
+          grep -n "WrapOpenGL_AGL" "$f" || true
 
+      # macOS target = x86_64 to MATCH the engine, which ships Intel-only (Apple Silicon arm64 has no
+      # working Zandronum audio). Uniform arch under Rosetta keeps host<->engine shared memory simple.
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSS_BUILD_LAUNCHER=ON
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSS_BUILD_LAUNCHER=ON ${{ runner.os == 'macOS' && '-DCMAKE_OSX_ARCHITECTURES=x86_64' || '' }}
 
       - name: Build
         run: cmake --build build --config Release
