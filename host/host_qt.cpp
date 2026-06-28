@@ -23,7 +23,12 @@
 #define SDL_MAIN_HANDLED            // we provide a plain main(); don't pull in SDL2main's WinMain shim
 #include <SDL.h>
 #include <QGuiApplication>
-#include <QQuickView>
+#include <QQuickWindow>
+#include <QQuickItem>
+#include <QSGImageNode>
+#include <QImage>
+#include <QTimer>
+#include <QColor>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -206,6 +211,47 @@ static void OnControllerRemoved(SDL_JoystickID instance) {
     }
 }
 
+// --- the Qt Quick compositor: one item per seat -------------------------------------------------
+// SeatItem is a scene-graph item bound to a seat index. Each frame it reads that seat's shared-memory
+// framebuffer (BGRA, bottom-up), wraps it as a QImage, uploads a QSGTexture, and draws it letterboxed
+// inside the item. The bottom-up source is corrected with the node's MirrorVertically transform (no CPU
+// flip). The GUI thread positions the items per core/ layout; this runs on Qt's render thread.
+class SeatItem : public QQuickItem {
+    Q_OBJECT
+public:
+    explicit SeatItem(QQuickItem* parent = nullptr) : QQuickItem(parent) { setFlag(ItemHasContents, true); }
+    void setSeat(int s) { m_seat = s; }
+protected:
+    QSGNode* updatePaintNode(QSGNode* old, UpdatePaintNodeData*) override {
+        int fw = 0, fh = 0;
+        QSGTexture* tex = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_clientsLock);
+            if (m_seat >= 0 && m_seat < (int)g_clients.size() && g_clients[m_seat].alive) {
+                Client& c = g_clients[m_seat];
+                OpenFb(c);
+                const int32_t* hdr = c.view ? (const int32_t*)c.view : nullptr;
+                if (hdr && hdr[0] == FB_MAGIC && hdr[1] > 0 && hdr[2] > 0) {
+                    fw = hdr[1]; fh = hdr[2];
+                    QImage img(c.view + FB_PIXELS_OFF, fw, fh, fw * 4, QImage::Format_RGB32);   // BGRA bytes
+                    tex = window()->createTextureFromImage(img);   // copies before we release the lock
+                }
+            }
+        }
+        if (!tex) { delete old; return nullptr; }   // nothing to draw this frame -> clear the node
+        QSGImageNode* node = static_cast<QSGImageNode*>(old);
+        if (!node) node = window()->createImageNode();
+        node->setTexture(tex);
+        node->setOwnsTexture(true);
+        node->setTextureCoordinatesTransform(QSGImageNode::MirrorVertically);   // glReadPixels is bottom-up
+        ss::Rect b = ss::Letterbox(ss::Rect{ 0, 0, (int)width(), (int)height() }, fw, fh);   // keep aspect
+        node->setRect(QRectF(b.x, b.y, b.w, b.h));
+        return node;
+    }
+private:
+    int m_seat = -1;
+};
+
 // Host-wide config resolved from argv/env at startup (mirrors the Win32 host's globals).
 struct HostConfig {
     int         numPlayers = 1;
@@ -249,13 +295,50 @@ int main(int argc, char** argv) {
 
     QGuiApplication app(argc, argv);
 
-    // Qt Quick scene: the seat compositor + overlay live here. The full scene QML + SeatItem land in the
-    // compositor stage; for now bring up the window so the Qt + SDL + core build links on both OSes.
-    QQuickView view;
-    view.setTitle("splitdronum");
-    view.setResizeMode(QQuickView::SizeRootObjectToView);
-    view.resize(1280, 720);
-    view.show();
+    // Qt Quick scene: one SeatItem per seat composites the framebuffers; the QML overlay is added on top
+    // in the overlay stage. The window owns its own render loop (RHI: D3D11 on Windows / Metal on macOS).
+    QQuickWindow window;
+    window.setTitle("splitdronum");
+    window.setColor(QColor(0, 0, 0));
+    window.resize(1280, 720);
+    QQuickItem* root = window.contentItem();
+    SeatItem* seats[4];
+    for (int i = 0; i < 4; ++i) { seats[i] = new SeatItem(root); seats[i]->setSeat(i); seats[i]->setVisible(false); }
+    window.show();
+
+    // ~60 Hz driver (GUI thread): poll pads, feed gameplay, then re-tile the seat items per core/ layout
+    // and repaint them. The manager/join glue (next stage) spawns/despawns seats against g_clients; until
+    // then the scene is simply empty (a black window).
+    QTimer driver;
+    QObject::connect(&driver, &QTimer::timeout, [&]() {
+        SDL_GameControllerUpdate();
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            if      (e.type == SDL_CONTROLLERDEVICEADDED)   OnControllerAdded(e.cdevice.which);
+            else if (e.type == SDL_CONTROLLERDEVICEREMOVED) OnControllerRemoved(e.cdevice.which);
+        }
+        FeedGameplay();
+        int W = (int)window.width(), H = (int)window.height();
+        ss::Rect paneFor[4]; bool show[4] = { false, false, false, false };
+        {
+            std::lock_guard<std::mutex> lk(g_clientsLock);
+            ss::Layout lay = ss::ComputeLayout(LiveCount(), W, H, ss::TwoMode::Auto);
+            int pane = 0;
+            for (int i = 0; i < 4; ++i) {
+                bool alive = i < (int)g_clients.size() && g_clients[i].alive;
+                if (alive && pane < lay.count) { paneFor[i] = lay.panes[pane++]; show[i] = true; }
+            }
+        }
+        for (int i = 0; i < 4; ++i) {
+            seats[i]->setVisible(show[i]);
+            if (show[i]) {
+                seats[i]->setPosition(QPointF(paneFor[i].x, paneFor[i].y));
+                seats[i]->setSize(QSizeF(paneFor[i].w, paneFor[i].h));
+                seats[i]->update();   // new framebuffer content -> repaint even when geometry is unchanged
+            }
+        }
+    });
+    driver.start(16);
 
     int rc = app.exec();
 
@@ -267,3 +350,5 @@ int main(int argc, char** argv) {
     SDL_Quit();
     return rc;
 }
+
+#include "host_qt.moc"   // AUTOMOC: SeatItem's Q_OBJECT lives in this .cpp
