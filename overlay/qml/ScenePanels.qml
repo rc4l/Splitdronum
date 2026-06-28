@@ -24,7 +24,9 @@ Item {
             join: ({ controller: index, seat: index, field: index,
                      word1: ["happy", "sneaky", "angry", "quick"][index],
                      word2: ["imp", "revvy", "baron", "fiend"][index],
-                     crosshair: index === 3 ? 0 : 3, motion: index % 2 === 0, taken: false })
+                     crosshair: index === 3 ? 0 : 3, motion: index % 2 === 0, taken: false,
+                     known: index === 1, hold: [0, 0.35, 0.7, 1.0][index],
+                     mode: 0, variant: "" })
         }
     }
 }

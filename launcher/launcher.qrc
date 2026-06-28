@@ -1,0 +1,7 @@
+<RCC>
+    <qresource prefix="/">
+        <file>qml/Launcher.qml</file>
+        <file alias="logo.png">../assets/logo.png</file>
+        <file alias="splitdronum.ico">../assets/splitdronum.ico</file>
+    </qresource>
+</RCC>

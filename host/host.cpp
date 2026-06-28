@@ -17,7 +17,7 @@
 #include <d3d11.h>             // GPU compositor: textured quads -> swap chain (GDI couldn't push a
 #include <d3dcompiler.h>       // large window at high refresh; the GPU does it trivially)
 #define XINPUT_USE_9_1_0
-#include <xinput.h>
+#include <xinput.h>             // structs/constants only -- the FUNCTION is loaded at runtime (below)
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -26,6 +26,25 @@
 #include "../core/ss_join.h"    // pure controller drop-in state machine (100%-tested; host owns the glue)
 #include "../core/ss_profile.h" // pure profile list + client launch-arg builder (100%-tested)
 #include "overlay_qt.h"          // Qt Quick cyberpunk overlay: renders qml/Overlay.qml -> a D3D11 texture
+
+// --- XInput loaded at RUNTIME (1.4 -> 1.3 -> 9.1.0) instead of linked statically. The legacy 9.1.0 the
+//     project linked sometimes fails to enumerate a controller that was already connected when the host
+//     started -- it only appears after a replug. XInput 1.4 (Win8+) enumerates connected/idle pads
+//     reliably; we fall back through the older runtimes if 1.4 is absent. Same XINPUT_STATE ABI across all. ---
+typedef DWORD (WINAPI* XInputGetState_t)(DWORD, XINPUT_STATE*);
+static XInputGetState_t g_xiGetState = nullptr;
+static void LoadXInput() {
+    const char* dlls[] = { "xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll" };
+    for (const char* name : dlls) {
+        HMODULE m = LoadLibraryA(name);
+        if (m) { g_xiGetState = (XInputGetState_t)GetProcAddress(m, "XInputGetState"); if (g_xiGetState) return; }
+    }
+}
+// Wrapper used everywhere instead of the statically-linked XInputGetState. Returns "not connected" until
+// the runtime is loaded, so callers behave exactly as if no pad were present.
+static DWORD XiGetState(DWORD idx, XINPUT_STATE* st) {
+    return g_xiGetState ? g_xiGetState(idx, st) : ERROR_DEVICE_NOT_CONNECTED;
+}
 
 // --- inject the DLL into a freshly-launched stock client, in two phases so the engine's main thread
 //     stays suspended until the DLL's window hooks are live (no startup-window flash). Splitting
@@ -76,6 +95,9 @@ static const int IN_CMDMAX  = 120;
 static volatile LONG g_mouseFreed = 0;    // 1 = release the mouse (a menu is up) so it can roam the desktop
 static float g_renderScale = 1.0f;        // client render res = monitor size * this (SS_RENDER_SCALE; <1 = faster/softer)
 static bool  g_smartScale  = true;        // scale render res down as more seats join (SS_SMARTSCALE=0 disables)
+static bool  g_autoStart   = true;        // auto-spawn seat 0 (kbd/mouse) at launch (SS_AUTOSTART=0 = wait screen)
+static volatile LONG g_kbmEverUp = 0;     // a kbd/mouse seat 0 has come up at least once (gate the rejoin prompt)
+static char  g_kbmProfile[64] = "";       // SS_KBM_PROFILE: the saved profile seat 0 loads (launcher pick), else ""
 enum { AX_Yaw = 0, AX_Pitch = 1, AX_Forward = 2, AX_Side = 3 };   // m_joy.h order
 
 // Optional per-axis look inversion (set from the environment by play.ps1). Defaults give
@@ -101,6 +123,14 @@ static volatile LONG       g_joinField = 0; // ss::JoinField: which field is foc
 static volatile LONG       g_joinW1 = 0, g_joinW2 = 0;          // name word indices being scrolled
 static volatile LONG       g_joinCross = 0, g_joinMotion = 0;   // chosen crosshair value + motion-comp flag
 static volatile LONG       g_joinTaken = 0;                     // 1 = composed name already loaded (create blocked)
+static volatile LONG       g_joinKnown = 0;                     // 1 = composed name has a saved profile (loaded)
+static volatile LONG       g_joinHold = 0;                      // controller hold-to-confirm progress 0..1000 (ring)
+static volatile LONG       g_kbHold   = 0;                      // keyboard (Enter) hold-to-join progress 0..1000 (ring)
+static volatile LONG       g_joinMode = 0;                      // ss::JoinMode published for the overlay (0 edit/1 variant/2 browse)
+static char                g_joinVariant[64] = "";             // generated variant name shown in the "in use?" dialog
+static ss::ProfileList     g_profiles;                          // saved configs the browser lists (refreshed on open)
+static volatile LONG       g_browseIndex = 0;                   // highlighted browser entry (published for the overlay)
+static CRITICAL_SECTION    g_profilesLock;                      // guards g_profiles (manager writes / render reads)
 static bool                g_padConn[4] = { false, false, false, false };  // XInput slot connected? (manager-updated)
 static int g_port = 10666;           // loopback server/connect port; resolved to a free one at startup
 static std::vector<DWORD>  g_hidePids;   // server + clients: their own windows are kept hidden
@@ -108,7 +138,7 @@ static std::vector<DWORD>  g_hidePids;   // server + clients: their own windows 
 static int LiveCount() { int n = 0; for (auto& c : g_clients) if (c.alive) ++n; return n; }
 
 // the staggered launch runs on a background thread so the compositor window is up immediately
-struct LaunchArgs { const char* dll; const char* exe; const char* iwad; const char* cwd; int n; const char* seatsCfg; };
+struct LaunchArgs { const char* dll; const char* exe; const char* iwad; const char* cwd; int n; const char* seatsCfg; const char* absoluteCfg; };
 static LaunchArgs  g_launch;
 static volatile LONG g_launchN = 0;      // clients spawned so far (for the loading text)
 static HWND        g_hwnd = NULL;        // compositor window (the render thread composites into it)
@@ -336,7 +366,9 @@ static void UpdateMusicOwner() {
     if (desired != g_musicOwner) {
         if (g_musicOwner >= 1 && g_musicOwner < (int)g_clients.size() && g_clients[g_musicOwner].alive)
             WriteCommand(g_clients[g_musicOwner], "snd_musicvolume 0");           // mute the previous owner
-        if (desired >= 0) WriteCommand(g_clients[desired], "exec splitseat.cfg"); // re-apply global cfg -> music on
+        // re-apply the preferred cfg (restores snd_musicvolume -> music on) THEN the absolute cfg, so the
+        // absolute stays the final say after a handoff too. AddCommandString runs both (';'-separated).
+        if (desired >= 0) WriteCommand(g_clients[desired], "exec splitseat.cfg; exec splitseat_absolute.cfg");
         g_musicOwner = desired;
     }
     LeaveCriticalSection(&g_clientsLock);
@@ -352,7 +384,7 @@ static void FeedGameplay() {
         if (!c.alive || c.pad < 0 || c.pad >= 4) continue;
         if (!g_padConn[c.pad]) continue;        // pad unplugged -> no input (manager rebinds it on replug)
         XINPUT_STATE xs;
-        if (XInputGetState((DWORD)c.pad, &xs) != ERROR_SUCCESS) continue;
+        if (XiGetState((DWORD)c.pad, &xs) != ERROR_SUCCESS) continue;
         if (xs.Gamepad.wButtons & XINPUT_GAMEPAD_BACK) {        // hold BACK to leave
             if (!g_backHold[c.pad]) g_backHold[c.pad] = timeGetTime();
             else if (timeGetTime() - g_backHold[c.pad] > 1200) { g_backHold[c.pad] = 0; c.alive = false; CloseClient(c); continue; }
@@ -422,9 +454,9 @@ static void Render(HWND hwnd) {
         pane++;
     }
     LeaveCriticalSection(&g_clientsLock);
-    if (!drew) {   // nothing rendering yet -- show a loading message instead of a black window
-        char msg[80];
-        _snprintf(msg, sizeof(msg), "Starting splitdronum...");
+    if (!drew) {   // nothing rendering yet -- show a prompt/loading message instead of a black window
+        const char* msg = (!g_autoStart && g_launchN == 0) ? "Press any key or controller button to start"
+                                                           : "Starting splitdronum...";
         SetBkMode(memDC, TRANSPARENT);
         SetTextColor(memDC, RGB(210, 210, 210));
         DrawTextA(memDC, msg, -1, &full, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -497,6 +529,21 @@ static void KillChildren() {
     }
 }
 
+// Normal-exit teardown: ask every client to quit CLEANLY (post WM_CLOSE) so the engine writes each seat's
+// -config ini -- that's what makes in-engine rebinds/cvars persist into the per-profile ini. Wait briefly
+// for them to go, then force-kill any straggler. (Force-only KillChildren stays for crash/abnormal paths.)
+static void GracefulKillChildren() {
+    for (DWORD pid : g_hidePids) EnumWindows(CloseByPid, (LPARAM)pid);   // WM_CLOSE -> clean engine shutdown + ini save
+    std::vector<HANDLE> hs;
+    for (DWORD pid : g_hidePids) { HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, pid); if (h) hs.push_back(h); }
+    for (size_t i = 0; i < hs.size(); i += MAXIMUM_WAIT_OBJECTS) {       // wait up to ~3s for clean exits
+        DWORD n = (DWORD)((hs.size() - i < MAXIMUM_WAIT_OBJECTS) ? hs.size() - i : MAXIMUM_WAIT_OBJECTS);
+        WaitForMultipleObjects(n, hs.data() + i, TRUE, 3000);
+    }
+    for (HANDLE h : hs) CloseHandle(h);
+    KillChildren();                                                     // force-kill anything that hung
+}
+
 // --- desktop gamma guard ---------------------------------------------------------------------
 // Each stock client sets a *global* hardware gamma ramp (SetDeviceGammaRamp) and only restores it
 // in a destructor on a clean exit. We TerminateProcess the clients, so that destructor never runs
@@ -517,8 +564,9 @@ static void RestoreGamma() {
     if (dc) { SetDeviceGammaRamp(dc, g_origGamma); ReleaseDC(NULL, dc); }
 }
 
-// console close / Ctrl+C / logoff / shutdown: kill children + restore the ramp before we go.
-static BOOL WINAPI CtrlHandler(DWORD) { KillChildren(); RestoreGamma(); return FALSE; }
+// console close / Ctrl+C / logoff / shutdown: quit children cleanly (save their inis) + restore the ramp.
+// (Within the OS's handler time budget; GracefulKillChildren caps its wait and force-kills stragglers.)
+static BOOL WINAPI CtrlHandler(DWORD) { GracefulKillChildren(); RestoreGamma(); return FALSE; }
 
 // host crashed: restore the desktop gamma and orphan-kill the clients, then let the process die.
 static LONG WINAPI CrashHandler(EXCEPTION_POINTERS*) {
@@ -530,23 +578,32 @@ static LONG WINAPI CrashHandler(EXCEPTION_POINTERS*) {
 //     live as controllers join (Start -> confirm card -> A) and leave (hold Back). The compositor
 //     window stays up the whole time; clients are born hidden (DLL CreateWindowEx hook) so none steal
 //     focus. A multi-word bind can't ride the command line, so the join binds go via splitseat.cfg. ---
-static void DeploySeatCfg() {
-    // Copy the user-editable global_seats.cfg verbatim to splitseat.cfg (every client +exec's it). If
-    // it's missing, fall back to the essential controller-join binds so a stock launch still works.
+// Copy a user-editable source cfg to a deployed name in the gamedir (where each client +execs it). If the
+// source is missing, write `fallback` (or nothing). One deploy per config layer.
+static void DeployOneCfg(const char* src, const char* destName, const char* fallback) {
     char cfgPath[600];
-    _snprintf(cfgPath, sizeof(cfgPath), "%s\\splitseat.cfg", g_launch.cwd);
+    _snprintf(cfgPath, sizeof(cfgPath), "%s\\%s", g_launch.cwd, destName); cfgPath[sizeof(cfgPath) - 1] = '\0';
     FILE* out = fopen(cfgPath, "w");
     if (!out) return;
-    FILE* in = g_launch.seatsCfg ? fopen(g_launch.seatsCfg, "rb") : NULL;
+    FILE* in = src ? fopen(src, "rb") : NULL;
     if (in) {
         char buf[2048]; size_t r;
         while ((r = fread(buf, 1, sizeof(buf), in)) > 0) fwrite(buf, 1, r, out);
         fclose(in);
-    } else {
-        fputs("bind pad_b \"ifspectator menu_join\"\n", out);
-        fputs("bind pad_x \"ifspectator menu_join\"\n", out);
+    } else if (fallback) {
+        fputs(fallback, out);
     }
     fclose(out);
+}
+static void DeploySeatCfg() {
+    // PREFERRED baseline -> splitseat.cfg (execed before the profile cfg, so profiles override it). Fallback
+    // keeps the music level the host's handoff re-exec relies on, in case the source file is missing.
+    DeployOneCfg(g_launch.seatsCfg, "splitseat.cfg", "snd_musicvolume 0.05\n");
+    // ABSOLUTE override -> splitseat_absolute.cfg (execed LAST, after the profile cfg, so it wins). Fallback
+    // is the ESSENTIAL controller-join binds (now an absolute), so a controller can always join even if the
+    // source file is missing. Always written, so the client's `+exec splitseat_absolute.cfg` never misses.
+    DeployOneCfg(g_launch.absoluteCfg, "splitseat_absolute.cfg",
+                 "bind pad_b \"ifspectator menu_join\"\nbind pad_x \"ifspectator menu_join\"\n");
 }
 
 // Spawn one stock client, connect it to the already-running loopback server, and add it as a seat.
@@ -562,6 +619,24 @@ static bool NameInUse(const char* name) {
     return used;
 }
 
+// Collect the profile names currently loaded by LIVE seats into buf/ptrs (so ss::ProfileVariant can pick a
+// free variant that won't collide with an in-use profile). Returns the count (<= cap).
+static int LiveNames(char buf[][ss::kProfileNameLen], const char* ptrs[], int cap) {
+    int n = 0;
+    EnterCriticalSection(&g_clientsLock);
+    for (auto& c : g_clients)
+        if (c.alive && c.name[0] && n < cap) { _snprintf(buf[n], ss::kProfileNameLen, "%s", c.name); ptrs[n] = buf[n]; ++n; }
+    LeaveCriticalSection(&g_clientsLock);
+    return n;
+}
+
+// Compose the variant name for `base` against the currently-loaded profiles (what the dialog shows + joins).
+static void VariantNameFor(char* out, int cap, const char* base) {
+    char buf[4][ss::kProfileNameLen]; const char* ptrs[4];
+    int n = LiveNames(buf, ptrs, 4);
+    ss::ProfileVariant(out, cap, base, ptrs, n);
+}
+
 // Write the generated profile to <gamedir>/profiles/<name>.cfg (the seat +exec's it). core/ss_profile
 // builds the body (name + crosshair, and movebob 0 when motion-sickness comp is on).
 static void WriteProfileCfg(const char* name, int crosshair, int motionComp) {
@@ -571,6 +646,57 @@ static void WriteProfileCfg(const char* name, int crosshair, int motionComp) {
     char body[512]; ss::ProfileBuildCfg(body, sizeof(body), name, crosshair, motionComp);
     FILE* f = fopen(path, "w");
     if (f) { fputs(body, f); fclose(f); }
+}
+
+// Load a saved profile's crosshair + motion-comfort back, so a returning player's settings reappear when
+// they scroll to that name. Returns true if profiles/<name>.cfg exists and parses (core/ss_profile).
+static bool LoadProfileCfg(const char* name, int* crosshair, int* motionComp) {
+    char path[700]; _snprintf(path, sizeof(path), "%s\\profiles\\%s.cfg", g_launch.cwd, name); path[sizeof(path) - 1] = '\0';
+    FILE* f = fopen(path, "r");
+    if (!f) return false;
+    char body[1024]; size_t n = fread(body, 1, sizeof(body) - 1, f); body[n] = '\0';
+    fclose(f);
+    return ss::ProfileParseCfg(body, crosshair, motionComp);
+}
+
+// --- per-seat-per-input recall: when a controller plays seat N, remember its exact selection so the SAME
+//     seat pre-fills it (and its settings) the next time a controller takes it. Stored as the four field
+//     indices in profiles/.seat<N>.last (controllers occupy slots 1..3; seat 0 is the keyboard). ---
+static void SaveSeatLast(int slot, int w1, int w2, int crosshair, int motion) {
+    if (slot < 1) return;
+    char path[700]; _snprintf(path, sizeof(path), "%s\\profiles\\.seat%d.last", g_launch.cwd, slot); path[sizeof(path) - 1] = '\0';
+    FILE* f = fopen(path, "w");
+    if (f) { fprintf(f, "%d %d %d %d\n", w1, w2, crosshair, motion); fclose(f); }
+}
+static bool LoadSeatLast(int slot, ss::JoinState& js) {
+    if (slot < 1) return false;
+    char path[700]; _snprintf(path, sizeof(path), "%s\\profiles\\.seat%d.last", g_launch.cwd, slot); path[sizeof(path) - 1] = '\0';
+    FILE* f = fopen(path, "r");
+    if (!f) return false;
+    int w1, w2, c, m; bool ok = (fscanf(f, "%d %d %d %d", &w1, &w2, &c, &m) == 4); fclose(f);
+    if (ok) { js.word1 = w1; js.word2 = w2; js.crosshair = c; js.motion = m; }
+    return ok;
+}
+// Scan <gamedir>/profiles/*.cfg into a ss::ProfileList (display names) for the load-existing browser.
+static void EnumerateProfiles(ss::ProfileList& list) {
+    list.count = 0;
+    char glob[700]; _snprintf(glob, sizeof(glob), "%s\\profiles\\*.cfg", g_launch.cwd); glob[sizeof(glob) - 1] = '\0';
+    WIN32_FIND_DATAA fd; HANDLE h = FindFirstFileA(glob, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do { if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) ss::ProfileAddFromFile(list, fd.cFileName); }
+    while (FindNextFileA(h, &fd));
+    FindClose(h);
+}
+
+// The slot SpawnClient will assign to the next CONTROLLER seat (lowest free 1..3, else append). Mirrors
+// SpawnClient's slot pick so we can pre-load that seat's remembered profile when the panel opens.
+static int NextControllerSlot() {
+    int slot = -1;
+    EnterCriticalSection(&g_clientsLock);
+    for (size_t i = 1; i < g_clients.size() && slot < 0; ++i) if (!g_clients[i].alive) slot = (int)i;
+    if (slot < 0 && g_clients.size() < 4) { slot = (int)g_clients.size(); if (slot < 1) slot = 1; }
+    LeaveCriticalSection(&g_clientsLock);
+    return slot;
 }
 
 // pad = the XInput slot driving the seat (-1 = seat 0, keyboard+mouse). profile = a profiles/<name>.cfg
@@ -631,6 +757,7 @@ static bool SpawnClient(int pad, const char* profile) {
     LeaveCriticalSection(&g_clientsLock);
     g_hidePids.push_back(pid);
     InterlockedIncrement(&g_launchN);
+    if (pad < 0) InterlockedExchange(&g_kbmEverUp, 1);   // the kbd/mouse seat has now existed -> rejoin prompt allowed
     return true;
 }
 
@@ -679,35 +806,49 @@ static DWORD WINAPI ManagerThread(LPVOID) {
     if (srvPid) g_hidePids.push_back(srvPid);
 
     g_clients.reserve(4);               // pin storage (<=4 seats) so the lock-free input path never races a realloc
-    SpawnClient(-1, nullptr);           // seat 0 = keyboard + mouse (fullscreen)
-    int initial = g_launch.n; if (initial > 4) initial = 4;
-    for (int s = 1; s < initial; ++s) SpawnClient(s - 1, nullptr);   // CLI -Players N: pre-assign pads 0..N-2 for testing
+    if (g_autoStart) {                  // auto-start: bring up the kbd/mouse seat (and any -Players N pads) now
+        SpawnClient(-1, g_kbmProfile[0] ? g_kbmProfile : nullptr);   // seat 0 = keyboard + mouse, with its chosen profile
+        int initial = g_launch.n; if (initial > 4) initial = 4;
+        for (int s = 1; s < initial; ++s) SpawnClient(s - 1, nullptr);   // CLI -Players N: pre-assign pads 0..N-2 for testing
+    }
+    // else: wait-screen start -- spawn nothing; the loop's Enter handler spawns seat 0, or a controller's
+    // START opens the join panel. RenderD3D draws the "press Enter / a controller button" prompt meanwhile.
 
     // Drop-in loop: feed assigned pads; watch UNassigned pads for Start -> confirm card -> A to join,
     // B / timeout to cancel. The compositor re-tiles automatically (layout is a function of live count).
     DWORD padCheck[4] = { 0, 0, 0, 0 };   // last poll of a DISCONNECTED slot (throttle the slow empty-slot query)
-    WORD  joinPrev[4] = { 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF };   // join-button edge-detect; 0xFFFF = not yet baselined
+    WORD  joinPrev[4] = { (WORD)ss::kPadUnsampled, (WORD)ss::kPadUnsampled,   // join-button edge-detect baselines
+                          (WORD)ss::kPadUnsampled, (WORD)ss::kPadUnsampled };  // (kPadUnsampled = not yet sampled)
     DWORD bannerUntil = 0;                // the active join flow aborts once this idle deadline passes
     ss::JoinState js;                     // the (tested) join state machine's state; published to g_join* below
-    bool seat0EnterPrev = false;        // edge-detect Enter for the keyboard-player rejoin
+    DWORD kbHoldStart = 0;               // keyboard hold-to-join timer (Enter held to bring up / rejoin seat 0)
     for (;;) {
         FeedGameplay();
         ReapDeadSeats();                // free seats that quit-game or crashed on their own
         UpdateMusicOwner();             // keep exactly one seat on music (hand off when seat 0 quits/rejoins)
         DWORD now = timeGetTime();
 
-        // Seat 0 (keyboard/mouse) rejoin -- a DIFFERENT path than controllers (no pad, no START button):
-        // once it has quit/crashed, pressing Enter while the host is focused respawns it (back in slot 0)
-        // with its default identity + the global config, the keyboard analog of a controller pressing Start.
-        bool seat0Enter = (g_hwnd && GetForegroundWindow() == g_hwnd) && (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
-        if (seat0Enter && !seat0EnterPrev && !Seat0Alive() && LiveCountLocked() < 4) SpawnClient(-1, nullptr);
-        seat0EnterPrev = seat0Enter;
+        // Keyboard hold-to-join (the kbd/mouse analog of a controller holding START): whenever there is no
+        // kbd/mouse seat and there's room, HOLD Enter (host focused) for kJoinHoldMs to bring seat 0 up. This
+        // covers BOTH the wait-screen start (auto-start off) and a rejoin after seat 0 leaves. A tap won't do
+        // it -- the ring (g_kbHold) fills while held so you can't start by accident. Controllers go through the
+        // create panel below. (auto-start on => seat 0 is already alive, so this never fires at launch.)
+        {
+            bool focused = g_hwnd && GetForegroundWindow() == g_hwnd;
+            bool enter   = focused && (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
+            bool canKbm  = !Seat0Alive() && LiveCountLocked() < 4;
+            int  kbHoldMs = 0;
+            if (enter && canKbm) { if (!kbHoldStart) kbHoldStart = now; kbHoldMs = (int)(now - kbHoldStart); }
+            else kbHoldStart = 0;
+            g_kbHold = canKbm ? ss::JoinHoldPermille(kbHoldMs) : 0;
+            if (kbHoldMs >= ss::kJoinHoldMs) { kbHoldStart = 0; SpawnClient(-1, g_kbmProfile[0] ? g_kbmProfile : nullptr); }
+        }
 
         // Refresh connection: poll a connected slot every loop, a disconnected one only ~1/s. XInput's
         // empty-slot query is slow, so hammering all four every frame is the documented perf hit.
         for (int p = 0; p < 4; ++p) {
             if (g_padConn[p] || now - padCheck[p] > 1000) {
-                XINPUT_STATE xs; bool conn = (XInputGetState(p, &xs) == ERROR_SUCCESS);
+                XINPUT_STATE xs; bool conn = (XiGetState(p, &xs) == ERROR_SUCCESS);
                 g_padConn[p] = conn; if (!conn) padCheck[p] = now;
             }
         }
@@ -730,53 +871,120 @@ static DWORD WINAPI ManagerThread(LPVOID) {
         // new seat -- so it's obvious which pad joined, with no specific button to hunt for. The overlay
         // (g_joinPad) names the free controller, or invites a press when several are free.
         // Create flow: the host reads XInput + edge-detects buttons; core/ss_join (100%-tested) decides the
-        // transitions. START opens the prompt; A/X/Y advances through name-word-1, name-word-2, crosshair,
-        // motion-comp and finally creates+joins; dpad L/R scrolls the current field; B backs out a step;
-        // unplug or a 20s idle deadline aborts. (sticks/shoulders never start it -- only a fresh START.)
+        // transitions. START opens the panel; dpad OR left stick navigate (up/down pick a field, left/right
+        // change it -- the stick flicks past a deadzone with Halo-style auto-repeat on hold); A/X/Y creates +
+        // joins; B backs out; unplug or a 20s idle deadline aborts. (only a fresh START opens it.)
         {
             bool room = LiveCountLocked() < 4;
             bool taken = false;   // 1 = the currently-composed name is already loaded (create blocked)
+            int  joinHoldPm = 0;  // hold-to-confirm progress published to the overlay ring (0 while idle)
+            static int   stickDir = 0;   // left-stick nav (auto-repeat) state; only one active join at a time
+            static DWORD stickNext = 0;
+            static bool  holdArmed = false; static DWORD holdStart = 0;   // START hold-to-confirm (release-gated)
+            static int   lastW1 = -1, lastW2 = -1; static bool known = false;   // profile-load tracking
             if (js.pad < 0) {
+                stickDir = 0; lastW1 = -1; lastW2 = -1; known = false;   // no active flow -> re-arm
+                holdArmed = false; holdStart = 0;   // the next flow must see START released before a hold counts
                 for (int p = 0; p < 4; ++p) {            // idle: scan free pads for a fresh START press
-                    if (!g_padConn[p] || PadAssigned(p)) { joinPrev[p] = 0xFFFF; continue; }
+                    if (!g_padConn[p] || PadAssigned(p)) { joinPrev[p] = (WORD)ss::kPadUnsampled; continue; }
                     XINPUT_STATE xs;
-                    if (XInputGetState(p, &xs) != ERROR_SUCCESS) { joinPrev[p] = 0xFFFF; continue; }
+                    if (XiGetState(p, &xs) != ERROR_SUCCESS) { joinPrev[p] = (WORD)ss::kPadUnsampled; continue; }
                     WORD b = xs.Gamepad.wButtons, prev = joinPrev[p]; joinPrev[p] = b;
-                    bool start = (prev != 0xFFFF) && (b & XINPUT_GAMEPAD_START & ~prev) != 0;
-                    if (ss::JoinTryStart(js, p, start, room)) { bannerUntil = now + 20000; break; }
+                    bool start = ss::PadButtonPressed(prev, b, XINPUT_GAMEPAD_START);
+                    if (ss::JoinTryStart(js, p, start, room)) {
+                        bannerUntil = now + 20000;
+                        LoadSeatLast(NextControllerSlot(), js);   // pre-fill this seat's last controller profile + settings
+                        EnterCriticalSection(&g_profilesLock); EnumerateProfiles(g_profiles); LeaveCriticalSection(&g_profilesLock);
+                        break;
+                    }
                 }
             } else {
                 XINPUT_STATE xs;
-                bool ok = (js.pad < 4) && g_padConn[js.pad] && (XInputGetState((DWORD)js.pad, &xs) == ERROR_SUCCESS);
+                bool ok = (js.pad < 4) && g_padConn[js.pad] && (XiGetState((DWORD)js.pad, &xs) == ERROR_SUCCESS);
                 WORD b = ok ? xs.Gamepad.wButtons : 0, prev = joinPrev[js.pad]; joinPrev[js.pad] = b;
                 WORD nb = b & ~prev;                     // newly pressed this frame
-                if (nb) bannerUntil = now + 20000;       // any input keeps the flow alive
+                // Left stick navigates too (Halo-style): flick past a deadzone to move, auto-repeat on hold.
+                int sx = ok ? xs.Gamepad.sThumbLX : 0, sy = ok ? xs.Gamepad.sThumbLY : 0;
+                int ax = sx < 0 ? -sx : sx, ay = sy < 0 ? -sy : sy;
+                const int ON = 18000, OFF = 11000;       // engage / release thresholds (axis is +/-32767)
+                int dir = 0;                             // 1 up / 2 down / 3 left / 4 right (dominant axis)
+                if (ay >= ax) { if (sy > ON) dir = 1; else if (sy < -ON) dir = 2; }
+                else          { if (sx > ON) dir = 4; else if (sx < -ON) dir = 3; }
+                if (dir == 0 && ax < OFF && ay < OFF) stickDir = 0;          // back near center -> re-arm
+                int stick = 0;
+                if (dir != 0) {
+                    if (dir != stickDir) { stick = dir; stickDir = dir; stickNext = now + 380; }   // flick -> fire now
+                    else if (now >= stickNext) { stick = dir; stickNext = now + 130; }             // hold -> auto-repeat
+                }
+                // Hold START to confirm (with the on-screen ring). Release-gated: the press that OPENED the
+                // panel doesn't count -- START must be released once, then held, so you can't accidentally join
+                // before adjusting settings. Holding it accumulates time -> the SM commits at kJoinHoldMs.
+                bool startHeld = ok && (b & XINPUT_GAMEPAD_START) != 0;
+                if (!startHeld) holdArmed = true;
+                int holdMs = 0;
+                if (holdArmed && startHeld) { if (!holdStart) holdStart = now; holdMs = (int)(now - holdStart); }
+                else holdStart = 0;
+                if (holdMs > 0) bannerUntil = now + 20000;     // holding keeps the flow alive
+                joinHoldPm = ss::JoinHoldPermille(holdMs);
+                if (nb || stick) bannerUntil = now + 20000;   // any input keeps the flow alive
                 ss::JoinInput in;
-                in.newButtons = ((nb & XINPUT_GAMEPAD_START) ? ss::JB_START : 0)
-                              | ((nb & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_X | XINPUT_GAMEPAD_Y)) ? ss::JB_CONFIRM : 0)
-                              | ((nb & XINPUT_GAMEPAD_B) ? ss::JB_CANCEL : 0)
-                              | ((nb & XINPUT_GAMEPAD_DPAD_LEFT)  ? ss::JB_LEFT  : 0)
-                              | ((nb & XINPUT_GAMEPAD_DPAD_RIGHT) ? ss::JB_RIGHT : 0)
-                              | ((nb & XINPUT_GAMEPAD_DPAD_UP)    ? ss::JB_UP    : 0)
-                              | ((nb & XINPUT_GAMEPAD_DPAD_DOWN)  ? ss::JB_DOWN  : 0);
+                in.newButtons = ss::JoinButtonsFromXInput(nb)        // dpad + face buttons (pure, tested)
+                              | (stick == 3 ? ss::JB_LEFT  : 0)       // analog-stick nav OR'd in by the host
+                              | (stick == 4 ? ss::JB_RIGHT : 0)
+                              | (stick == 1 ? ss::JB_UP    : 0)
+                              | (stick == 2 ? ss::JB_DOWN  : 0);
+                // EDIT + BROWSE accumulate the hold (hold-to-confirm / hold-to-load); the variant dialog is Yes/No.
+                in.confirmHoldMs  = (js.mode != ss::JM_VARIANT) ? holdMs : 0;
                 in.connected      = ok;
                 in.timedOut       = (now > bannerUntil);
                 in.word1Count     = ss::ProfileWord1Count();
                 in.word2Count     = ss::ProfileWord2Count();
                 in.crosshairCount = ss::kCrosshairMax + 1;
+                in.profileCount   = g_profiles.count;    // saved configs the browser can scroll (Y opens it)
+                in.selTaken       = (js.mode == ss::JM_BROWSE && js.browseIndex >= 0 && js.browseIndex < g_profiles.count)
+                                    ? NameInUse(g_profiles.names[js.browseIndex]) : false;
                 char curName[64]; ss::ProfileComposeName(curName, sizeof(curName), js.word1, js.word2);
                 in.nameInUse = NameInUse(curName);       // two seats can't load the same profile at once
                 taken = in.nameInUse;
+                static int prevMode = ss::JM_EDIT;
                 ss::JoinResult r = ss::JoinAdvance(js, in);
                 if (r.action == ss::JoinAction::Join) {
-                    char nm[64]; ss::ProfileComposeName(nm, sizeof(nm), r.word1, r.word2);
-                    WriteProfileCfg(nm, r.crosshair, r.motion);   // save profiles/<name>.cfg, then spawn it
+                    int slot = NextControllerSlot();              // the slot SpawnClient is about to fill
+                    char base[64], nm[64]; int ch = r.crosshair, mo = r.motion;
+                    if (r.fromBrowse && r.browseIndex >= 0 && r.browseIndex < g_profiles.count) {
+                        _snprintf(base, sizeof(base), "%s", g_profiles.names[r.browseIndex]); base[sizeof(base) - 1] = '\0';
+                        LoadProfileCfg(base, &ch, &mo);           // load the selected config's settings
+                    } else {
+                        ss::ProfileComposeName(base, sizeof(base), r.word1, r.word2);
+                    }
+                    if (r.variant)         { VariantNameFor(nm, sizeof(nm), base); WriteProfileCfg(nm, ch, mo); }   // new variant cfg
+                    else if (r.fromBrowse) { _snprintf(nm, sizeof(nm), "%s", base); }                               // load existing as-is
+                    else                   { _snprintf(nm, sizeof(nm), "%s", base); WriteProfileCfg(nm, ch, mo); }   // auto-save edited
+                    nm[sizeof(nm) - 1] = '\0';
                     SpawnClient(r.pad, nm);
+                    if (!r.fromBrowse) SaveSeatLast(slot, r.word1, r.word2, r.crosshair, r.motion);   // word-recall (editor only)
                 }
+                // refresh the browser list whenever it (re)opens; the variant dialog forces a fresh START re-hold
+                if (js.mode == ss::JM_BROWSE && prevMode != ss::JM_BROWSE) {
+                    EnterCriticalSection(&g_profilesLock); EnumerateProfiles(g_profiles); LeaveCriticalSection(&g_profilesLock);
+                }
+                if (js.mode == ss::JM_VARIANT) { holdArmed = false; holdStart = 0; }
+                prevMode = js.mode;
+                // returning-player load: when the composed name changes to a saved profile, reload its settings
+                if (js.pad >= 0 && (js.word1 != lastW1 || js.word2 != lastW2)) {
+                    lastW1 = js.word1; lastW2 = js.word2;
+                    char ln[64]; ss::ProfileComposeName(ln, sizeof(ln), js.word1, js.word2);
+                    int lc, lm; known = LoadProfileCfg(ln, &lc, &lm);
+                    if (known) { js.crosshair = lc; js.motion = lm; }
+                }
+                // publish the variant name for the "<name> is in use -- load as <variant>?" dialog
+                if (js.mode == ss::JM_VARIANT) VariantNameFor(g_joinVariant, sizeof(g_joinVariant), curName);
+                else g_joinVariant[0] = '\0';
             }
             InterlockedExchange(&g_joinPad, js.pad);     // publish for the render thread (DrawJoinPrompt reads these)
             g_joinField = js.field; g_joinW1 = js.word1; g_joinW2 = js.word2;
-            g_joinCross = js.crosshair; g_joinMotion = js.motion; g_joinTaken = taken;
+            g_joinCross = js.crosshair; g_joinMotion = js.motion; g_joinTaken = taken; g_joinKnown = known;
+            g_joinHold = joinHoldPm; g_joinMode = js.mode; g_browseIndex = js.browseIndex;   // ring + mode + browser pos
         }
         Sleep(8);
     }
@@ -918,12 +1126,13 @@ static void DrawJoinPrompt(ss::Rect area) {
         RECT r1 = { 0, 14, TW, 52 }; DrawTextA(dc, l1, -1, &r1, DT_CENTER | DT_SINGLELINE);
         char nm[64]; ss::ProfileComposeName(nm, sizeof(nm), w1, w2);
         char mid[160];
-        const char* hint = taken ? "name taken -- change it      A  create + join      B  back"
-                                  : "up/down select    left/right change    A  create + join    B  back";
-        if (field == ss::JF_WORD1)          _snprintf(mid, sizeof(mid), "<  %s  >%s", ss::ProfileWord1(w1), ss::ProfileWord2(w2));
-        else if (field == ss::JF_WORD2)     _snprintf(mid, sizeof(mid), "%s<  %s  >", ss::ProfileWord1(w1), ss::ProfileWord2(w2));
-        else if (field == ss::JF_CROSSHAIR) _snprintf(mid, sizeof(mid), "%s    crosshair <  %d  >", nm, cross);
-        else                                _snprintf(mid, sizeof(mid), "%s    motion comfort <  %s  >", nm, motion ? "ON" : "off");
+        const char* hint = taken ? "name taken -- up/down to a free one      hold Start to join      B  back"
+                                  : "left/right select    up/down change    hold Start join    B  back";
+        // brackets mark the focused field (left/right moves them, up/down changes the bracketed value)
+        if (field == ss::JF_WORD1)          _snprintf(mid, sizeof(mid), "[ %s ] %s", ss::ProfileWord1(w1), ss::ProfileWord2(w2));
+        else if (field == ss::JF_WORD2)     _snprintf(mid, sizeof(mid), "%s [ %s ]", ss::ProfileWord1(w1), ss::ProfileWord2(w2));
+        else if (field == ss::JF_CROSSHAIR) _snprintf(mid, sizeof(mid), "%s    crosshair [ %d ]", nm, cross);
+        else                                _snprintf(mid, sizeof(mid), "%s    motion comfort [ %s ]", nm, motion ? "ON" : "off");
         SelectObject(dc, fb); SetTextColor(dc, taken ? RGB(255, 140, 140) : RGB(150, 220, 255));
         RECT r2 = { 0, 56, TW, 106 }; DrawTextA(dc, mid, -1, &r2, DT_CENTER | DT_SINGLELINE);
         SelectObject(dc, fs); SetTextColor(dc, RGB(140, 150, 170));
@@ -1017,6 +1226,10 @@ static void RenderD3D(HWND hwnd) {
     g_ctx->RSSetState(g_raster);
     g_ctx->IASetInputLayout(nullptr);
     g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    // Wait-screen start (auto-start off, nothing spawned yet): no early return -- we fall through so the Qt
+    // overlay renders the prompt + the keyboard hold-ring AND any controller's join panel over the black
+    // window. (The GDI fallback below draws a plain prompt instead.)
+    bool waitStart = (!g_autoStart && g_launchN == 0);
     EnterCriticalSection(&g_clientsLock);
     int live = LiveCount();
     // A controller that confirmed the prompt and is customizing reserves its OWN pane up front, so the
@@ -1080,13 +1293,28 @@ static void RenderD3D(HWND hwnd) {
         // alpha-composite it full-window over the seats.
         int jp = (int)InterlockedCompareExchange(&g_joinPad, -1, -1);
         ovl::SetScreen(W, H);
-        ovl::SetSeat0Gone(Seat0Alive() ? 0 : 1);
+        ovl::SetSeat0Gone((g_kbmEverUp && !Seat0Alive()) ? 1 : 0);   // only after kbd/mouse has actually been up
+        ovl::SetWaitStart(waitStart ? 1 : 0);                        // wait-screen prompt (auto-start off, nothing up)
+        ovl::SetKbHold((int)g_kbHold);                               // keyboard Enter hold-to-join ring (0..1000)
         ovl::SetDisconnects(discCount, discSeats, discPanes);
         if (jp >= 0)
             ovl::SetJoin(1, jp + 1, pane, (int)g_joinField, ss::ProfileWord1((int)g_joinW1), ss::ProfileWord2((int)g_joinW2),
-                         (int)g_joinCross, (int)g_joinMotion, (int)g_joinTaken, area.x, area.y, area.w, area.h);   // pane = the joining seat
+                         (int)g_joinCross, (int)g_joinMotion, (int)g_joinTaken, (int)g_joinKnown, (int)g_joinHold,
+                         (int)g_joinMode, g_joinVariant, area.x, area.y, area.w, area.h);
         else
-            ovl::SetJoin(0, 0, 0, 0, "", "", 0, 0, 0, 0, 0, 0, 0);
+            ovl::SetJoin(0, 0, 0, 0, "", "", 0, 0, 0, 0, 0, 0, "", 0, 0, 0, 0);
+        // saved-config browser list (only while the panel is in browse mode)
+        if (jp >= 0 && g_joinMode == ss::JM_BROWSE) {
+            char nb[ss::kMaxProfiles][ss::kProfileNameLen]; int cnt;
+            EnterCriticalSection(&g_profilesLock);
+            cnt = g_profiles.count; for (int i = 0; i < cnt; ++i) _snprintf(nb[i], ss::kProfileNameLen, "%s", g_profiles.names[i]);
+            LeaveCriticalSection(&g_profilesLock);
+            const char* names[ss::kMaxProfiles]; int takenArr[ss::kMaxProfiles];
+            for (int i = 0; i < cnt; ++i) { names[i] = nb[i]; takenArr[i] = NameInUse(nb[i]) ? 1 : 0; }
+            ovl::SetBrowse(1, cnt, names, takenArr, (int)g_browseIndex);
+        } else {
+            ovl::SetBrowse(0, 0, nullptr, nullptr, 0);
+        }
         ID3D11ShaderResourceView* osrv = (ID3D11ShaderResourceView*)ovl::Render(W, H);
         if (osrv) {                              // Qt clobbered the context -> re-bind our pipeline + blend
             g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr);
@@ -1106,12 +1334,15 @@ static void RenderD3D(HWND hwnd) {
             g_ctx->Draw(4, 0);
             g_ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
         }
-    } else {                                     // GDI fallback (Qt unavailable)
+    } else {                                     // GDI fallback (Qt unavailable) -- no ring, just text
         DrawJoinPrompt(area);
-        if (!Seat0Alive()) {
-            int tw, th; ID3D11ShaderResourceView* s = TextTexture("seat 0 left  -  press Enter to rejoin", &tw, &th);
+        const char* msg = nullptr;
+        if (waitStart)                       msg = "Hold Enter (keyboard) or press Start on a controller to join";
+        else if (g_kbmEverUp && !Seat0Alive()) msg = "seat 0 left  -  hold Enter to rejoin";
+        if (msg) {
+            int tw, th; ID3D11ShaderResourceView* s = TextTexture(msg, &tw, &th);
             if (s) {
-                D3D11_VIEWPORT vp = { (float)((W - tw) / 2), 24.0f, (float)tw, (float)th, 0.0f, 1.0f };
+                D3D11_VIEWPORT vp = { (float)((W - tw) / 2), waitStart ? (float)((H - th) / 2) : 24.0f, (float)tw, (float)th, 0.0f, 1.0f };
                 g_ctx->RSSetViewports(1, &vp);
                 g_ctx->PSSetShaderResources(0, 1, &s);
                 g_ctx->Draw(4, 0);
@@ -1222,7 +1453,8 @@ int main(int argc, char** argv) {
     const char* exe = argv[3];
     const char* iwad = argv[4];
     const char* cwd = (argc > 5) ? argv[5] : NULL;
-    const char* seatsCfg = (argc > 6) ? argv[6] : NULL;   // global config for all seats (global_seats.cfg)
+    const char* seatsCfg = (argc > 6) ? argv[6] : NULL;       // preferred baseline (seats_preferred.cfg)
+    const char* absoluteCfg = (argc > 7) ? argv[7] : NULL;    // absolute override (seats_absolute.cfg)
     // Hide our own console so only the game window shows. Guard on GetConsoleProcessList: hide only
     // when host owns the console (count == 1, e.g. launched detached by play.ps1), never a shell's
     // console we were merely launched into from an interactive prompt (that would hide the user's terminal).
@@ -1238,6 +1470,9 @@ int main(int argc, char** argv) {
           if (g_renderScale < 0.25f) g_renderScale = 0.25f;     // floor: don't render absurdly low
           if (g_renderScale > 2.0f)  g_renderScale = 2.0f; } }  // ceil: supersample at most 2x
     { const char* sm = getenv("SS_SMARTSCALE"); if (sm && sm[0] == '0') g_smartScale = false; }  // opt out
+    { const char* as = getenv("SS_AUTOSTART");  if (as && as[0] == '0') g_autoStart  = false; }  // wait-screen start
+    { const char* kp = getenv("SS_KBM_PROFILE"); if (kp && kp[0]) { _snprintf(g_kbmProfile, sizeof(g_kbmProfile), "%s", kp); g_kbmProfile[sizeof(g_kbmProfile)-1] = '\0'; } }
+    LoadXInput();   // resolve XInputGetState from the newest available runtime before any pad polling starts
 
     FILE* L = fopen("host_debug.log", "w");
 
@@ -1282,8 +1517,10 @@ int main(int argc, char** argv) {
     g_clients.reserve(4);
     g_hidePids.reserve(64);
     InitializeCriticalSection(&g_clientsLock);   // guards the dynamic seat list (manager vs render/main)
+    InitializeCriticalSection(&g_profilesLock);  // guards the browser's profile list (manager vs render)
     g_launch.dll = dll; g_launch.exe = exe; g_launch.iwad = iwad; g_launch.cwd = cwd; g_launch.n = n;
     g_launch.seatsCfg = seatsCfg;
+    g_launch.absoluteCfg = absoluteCfg;
     g_hwnd = hwnd;
     CreateThread(NULL, 0, RenderThread, NULL, 0, NULL);    // compositing runs off the main thread
     CreateThread(NULL, 0, ManagerThread, NULL, 0, NULL);   // server + seat 0, then live controller join/leave
@@ -1296,7 +1533,7 @@ int main(int argc, char** argv) {
     DWORD lastSlow = timeGetTime();
     for (;;) {
         while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {   // mouse/keyboard at the full loop rate
-            if (msg.message == WM_QUIT) { timeEndPeriod(1); KillChildren(); RestoreGamma(); return 0; }
+            if (msg.message == WM_QUIT) { timeEndPeriod(1); GracefulKillChildren(); RestoreGamma(); return 0; }
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }

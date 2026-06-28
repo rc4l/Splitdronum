@@ -20,8 +20,13 @@ param(
                                  # (faster, softer HUD); >1 supersamples (crisper, heavier). 0.25-2.0.
     [int]$Fps = -1,              # client render fps cap: -1 = monitor refresh rate (default),
                                  # 0 = uncapped, >0 = that fixed cap. (Readback always tracks refresh.)
-    [bool]$SmartScale = $true    # auto-lower each seat's render res by live player count (1->1.0,
-)                                # 2->0.75, 3-4->0.5) on top of -RenderScale. -SmartScale:$false = fixed.
+    [bool]$SmartScale = $true,   # auto-lower each seat's render res by live player count (1->1.0,
+                                 # 2->0.75, 3-4->0.5) on top of -RenderScale. -SmartScale:$false = fixed.
+    [switch]$NoAutoStartKBM,     # default (absent): start immediately with keyboard+mouse as Player 1.
+                                 # present: open on a "press anything to start" screen -- first input claims P1.
+                                 # (a switch, not a [bool], so it survives `powershell -File` from the launcher.)
+    [string]$KbmProfile = ''     # the saved profile the keyboard+mouse seat 0 loads (blank = default identity).
+)                                # the launcher passes the chosen config here when several exist.
 $root = $PSScriptRoot
 if ($MouseInvertY) { $env:SS_MOUSE_INVY = '1' } else { Remove-Item Env:\SS_MOUSE_INVY -ErrorAction SilentlyContinue }
 if ($PadInvertY)   { $env:SS_PAD_INVY   = '1' } else { Remove-Item Env:\SS_PAD_INVY   -ErrorAction SilentlyContinue }
@@ -29,6 +34,8 @@ if ($PadInvertX)   { $env:SS_PAD_INVX   = '1' } else { Remove-Item Env:\SS_PAD_I
 $env:SS_RENDER_SCALE = "$RenderScale"
 if ($Fps -ge 0) { $env:SS_FPS = "$Fps" } else { $env:SS_FPS = 'auto' }
 if ($SmartScale) { $env:SS_SMARTSCALE = '1' } else { $env:SS_SMARTSCALE = '0' }
+if ($NoAutoStartKBM) { $env:SS_AUTOSTART = '0' } else { $env:SS_AUTOSTART = '1' }
+if ($KbmProfile) { $env:SS_KBM_PROFILE = $KbmProfile } else { Remove-Item Env:\SS_KBM_PROFILE -EA SilentlyContinue }
 # Private engine: splitdronum runs its OWN copy of the engine + gamedir, so other sessions sharing the
 # upstream build can't change our config / data / instances and we can't change theirs. Copied once on
 # first run; delete splitdronum\engine to refresh it from -EngineSrc.
@@ -65,7 +72,8 @@ $GamePath = (Resolve-Path $GamePath).Path
 $gameDir  = Split-Path $GamePath
 $dll = Join-Path $root 'build\ss_hook.dll'
 $exe = Join-Path $root 'build\host.exe'
-$globalSeatsCfg = Join-Path $root 'global_seats.cfg'   # global config applied to every seat (edit to taste)
+$preferredCfg = Join-Path $root 'seats_preferred.cfg'  # baseline applied to every seat (a profile overrides it)
+$absoluteCfg  = Join-Path $root 'seats_absolute.cfg'   # absolute override -- execed last, wins over everything
 
 # Rebuild the DLL when the engine was just copied (offsets must match it) or when it's missing. The DLL
 # bakes in engine symbol RVAs; if the engine differs from what the DLL was built against, its hooks land
@@ -78,5 +86,5 @@ Write-Host "launching $Players-player splitscreen (seat 0 = kbd/mouse, seats 1+ 
 # Launch the compositor detached in its own hidden console, so the only thing you see is the game
 # window -- no terminal lingering in the background. host.exe owns that new console, so it self-hides
 # as a backstop too. Close the game window to stop everything.
-$argline = "$Players `"$dll`" `"$GamePath`" $Iwad `"$gameDir`" `"$globalSeatsCfg`""
+$argline = "$Players `"$dll`" `"$GamePath`" $Iwad `"$gameDir`" `"$preferredCfg`" `"$absoluteCfg`""
 Start-Process -FilePath $exe -ArgumentList $argline -WindowStyle Hidden

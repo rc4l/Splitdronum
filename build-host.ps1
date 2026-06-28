@@ -31,7 +31,7 @@ $qtL = "`"$qtLib\Qt6Core.lib`" `"$qtLib\Qt6Gui.lib`" `"$qtLib\Qt6Qml.lib`" `"$qt
 
 # overlay_qt.cpp needs Qt's required /permissive- (strict conformance); compile it to an .obj on its own
 # so host.cpp keeps its relaxed flags, then link everything together.
-cmd /c "`"$vcvars`" >nul && cd /d `"$out`" && rc /nologo /fo host.res `"$rc`" && cl /c /nologo /O2 /EHsc /std:c++17 /Zc:__cplusplus /permissive- $qtI `"$overlay`" && cl /nologo /O2 /EHsc /Fe:host.exe `"$hostcpp`" `"$layout`" `"$join`" `"$profile`" overlay_qt.obj host.res user32.lib gdi32.lib xinput9_1_0.lib winmm.lib dwmapi.lib d3d11.lib dxgi.lib d3dcompiler.lib ws2_32.lib $qtL"
+cmd /c "`"$vcvars`" >nul && cd /d `"$out`" && rc /nologo /fo host.res `"$rc`" && cl /c /nologo /O2 /EHsc /std:c++17 /Zc:__cplusplus /permissive- $qtI `"$overlay`" && cl /nologo /O2 /EHsc /Fe:host.exe `"$hostcpp`" `"$layout`" `"$join`" `"$profile`" overlay_qt.obj host.res user32.lib gdi32.lib winmm.lib dwmapi.lib d3d11.lib dxgi.lib d3dcompiler.lib ws2_32.lib $qtL"
 
 if (Test-Path (Join-Path $out 'host.exe')) {
     # stage the Qt runtime (DLLs + QtQuick/QtQuick.Effects plugins) next to host.exe so it loads

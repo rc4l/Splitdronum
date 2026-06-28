@@ -67,6 +67,26 @@ void ovl::SetSeat0Gone(int gone)
     if (g_root) g_root->setProperty("seat0Gone", gone != 0);
 }
 
+void ovl::SetWaitStart(int waiting)
+{
+    if (g_root) g_root->setProperty("waitStart", waiting != 0);
+}
+
+void ovl::SetKbHold(int permille)
+{
+    if (g_root) g_root->setProperty("kbHold", permille / 1000.0);   // 0..1 ring progress
+}
+
+void ovl::SetBrowse(int active, int count, const char* const* names, const int* taken, int index)
+{
+    if (!g_root) return;
+    if (!active) { g_root->setProperty("browse", QVariant()); return; }
+    QVariantList items;
+    for (int i = 0; i < count; ++i)
+        items.append(QVariantMap{ {"name", QString::fromUtf8(names[i])}, {"taken", taken[i] != 0} });
+    g_root->setProperty("browse", QVariantMap{ {"index", index}, {"items", items} });
+}
+
 void ovl::SetDisconnects(int count, const int* seats, const int* paneXYWH)
 {
     if (!g_root) return;
@@ -79,7 +99,8 @@ void ovl::SetDisconnects(int count, const int* seats, const int* paneXYWH)
 }
 
 void ovl::SetJoin(int active, int controller, int seat, int field, const char* word1, const char* word2,
-                  int crosshair, int motion, int taken, int px, int py, int pw, int ph)
+                  int crosshair, int motion, int taken, int known, int holdPermille,
+                  int mode, const char* variant, int px, int py, int pw, int ph)
 {
     if (!g_root) return;
     if (!active) { g_root->setProperty("join", QVariant()); return; }
@@ -87,7 +108,9 @@ void ovl::SetJoin(int active, int controller, int seat, int field, const char* w
     g_root->setProperty("join", QVariantMap{
         {"controller", controller}, {"seat", seat}, {"field", field},
         {"word1", QString::fromUtf8(word1)}, {"word2", QString::fromUtf8(word2)},
-        {"crosshair", crosshair}, {"motion", motion != 0}, {"taken", taken != 0}, {"pane", pane} });
+        {"crosshair", crosshair}, {"motion", motion != 0}, {"taken", taken != 0}, {"known", known != 0},
+        {"hold", holdPermille / 1000.0}, {"mode", mode}, {"variant", QString::fromUtf8(variant)},
+        {"pane", pane} });   // hold = 0..1 ring progress; mode 0 edit / 1 variant-confirm
 }
 
 void* ovl::Render(int w, int h)

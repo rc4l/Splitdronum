@@ -40,8 +40,22 @@ const char* ProfileWord2(int i);
 // Compose "word1word2" into buf[cap] (lowercase, NUL-terminated); indices wrapped into their lists.
 void ProfileComposeName(char* buf, int cap, int w1, int w2);
 
+// Pick an AVAILABLE variant of `base`: returns `base` itself when it isn't in `taken`, otherwise the first
+// of base+"2", base+"3", ... that isn't in `taken`. Used when two seats want the same profile -- the second
+// loads as a variant. taken = array of n names already loaded/existing. Writes out[cap] (NUL-terminated).
+void ProfileVariant(char* out, int cap, const char* base, const char* const* taken, int n);
+
+// The human-facing player name for a profile key: underscores become spaces ("angry_imp_2" -> "angry imp 2").
+// The key (underscored) stays the file/identity; the display form is the authoritative in-game +name.
+void ProfileDisplayName(char* out, int cap, const char* key);
+
 // Build the cfg body for a created profile (written to profiles/<name>.cfg, +exec'd by its seat): sets
 // the player name + crosshair, and -- when motion-sickness compensation is on -- movebob 0 (no view bob).
 void ProfileBuildCfg(char* buf, int cap, const char* name, int crosshair, int motionComp);
+
+// Parse a profile cfg (as written by ProfileBuildCfg) back into crosshair + motion-comfort, so a returning
+// player's saved settings reload when they scroll to that name. Returns true if a crosshair line was found
+// (i.e. it reads as a profile). Tolerant of CRLF / extra lines; out-params may be null.
+bool ProfileParseCfg(const char* cfg, int* crosshair, int* motionComp);
 
 }

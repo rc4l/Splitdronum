@@ -1,0 +1,3 @@
+// Win32 resource script for launcher.exe -- the EXE's file icon (Explorer/taskbar).
+// Icon ID 1 = the lowest-numbered icon, which is what Explorer uses for the EXE.
+1 ICON "../assets/splitdronum.ico"
