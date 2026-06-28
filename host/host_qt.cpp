@@ -936,6 +936,9 @@ int main(int argc, char** argv) {
     ParseEnv();
 
 #ifdef _WIN32
+    // Hide our OWN console (play.ps1 launches us detached) so only the game window shows -- but only when
+    // we own the console, never a shell we were launched into interactively.
+    { DWORD cpl[2]; if (GetConsoleProcessList(cpl, 2) == 1) ShowWindow(GetConsoleWindow(), SW_HIDE); }
     WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
     SDL_SetMainReady();
@@ -971,6 +974,9 @@ int main(int argc, char** argv) {
     window.requestActivate();
 #ifdef _WIN32
     HWND winHandle = (HWND)window.winId();
+    // play.ps1 launches us with -WindowStyle Hidden (to hide the console); that STARTUPINFO SW_HIDE would
+    // otherwise suppress our first window-show, so force the window visible, then claim foreground.
+    ShowWindow(winHandle, SW_SHOWNORMAL);
     ForceForeground(winHandle);
 #else
     void* winHandle = nullptr;
