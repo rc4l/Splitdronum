@@ -17,8 +17,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.1'
+          cache: true
+
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSS_BUILD_LAUNCHER=ON
 
       - name: Build
         run: cmake --build build --config Release

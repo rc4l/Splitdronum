@@ -28,3 +28,10 @@ add_executable(ss_tests
 target_link_libraries(ss_tests PRIVATE ss_core)
 target_include_directories(ss_tests PRIVATE third_party)
 add_test(NAME ss_tests COMMAND ss_tests)
+
+# --- launcher: Qt Quick GUI, cross-platform. Off by default so the core/tests build needs no Qt;
+#     CI (and local Qt builds) turn it on with -DSS_BUILD_LAUNCHER=ON after installing Qt. ---
+option(SS_BUILD_LAUNCHER "Build the Qt Quick launcher (requires Qt6)" OFF)
+if(SS_BUILD_LAUNCHER)
+    add_subdirectory(launcher)
+endif()
