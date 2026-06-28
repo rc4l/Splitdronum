@@ -36,13 +36,14 @@ if(SS_BUILD_LAUNCHER)
     add_subdirectory(launcher)
 endif()
 
-# --- host: the cross-platform SDL2 compositor (Windows + macOS). Off by default so the core/tests
-#     build stays dependency-free; CI turns it on with -DSS_BUILD_HOST=ON. SDL2 is fetched + built
-#     STATIC (FetchContent), so the host links to a single self-contained binary -- no SDL runtime to
-#     ship. SDL_Renderer uses D3D11 on Windows and Metal on macOS under the hood, so the compositor is
-#     GPU-accelerated on both. The legacy Win32/D3D11/Qt host (host/host.cpp) stays for now; this is
-#     the multiplatform target the release pipeline packages. ---
-option(SS_BUILD_HOST "Build the cross-platform SDL2 host/compositor (fetches SDL2)" OFF)
+# --- host: the cross-platform Qt host/compositor (Windows + macOS). Off by default so the core/tests
+#     build stays dependency-free; CI turns it on with -DSS_BUILD_HOST=ON. Qt Quick is the compositor:
+#     it renders the seat framebuffers AND the QML overlay in one scene, on Qt's RHI (D3D11 on Windows,
+#     Metal on macOS) -- so there is no platform-specific GPU code. SDL2 is fetched + built STATIC and
+#     used ONLY for gamepad input (Qt 6 has no gamepad module); no SDL window or renderer. The legacy
+#     Win32/D3D11 host (host/host.cpp) stays during the port; this is the multiplatform target the
+#     release pipeline packages. ---
+option(SS_BUILD_HOST "Build the cross-platform Qt host/compositor (requires Qt6; fetches SDL2 for pads)" OFF)
 if(SS_BUILD_HOST)
     include(FetchContent)
     set(SDL_SHARED      OFF CACHE BOOL "" FORCE)   # static: fold SDL into the host binary
@@ -53,8 +54,10 @@ if(SS_BUILD_HOST)
         URL https://github.com/libsdl-org/SDL/releases/download/release-2.30.9/SDL2-2.30.9.tar.gz)
     FetchContent_MakeAvailable(SDL2)
 
-    add_executable(sshost host/host_sdl.cpp)
-    target_link_libraries(sshost PRIVATE ss_core SDL2::SDL2-static)
+    find_package(Qt6 REQUIRED COMPONENTS Quick Gui Qml)
+
+    add_executable(sshost host/host_qt.cpp)
+    set_target_properties(sshost PROPERTIES AUTOMOC ON OUTPUT_NAME host)   # ships as host(.exe)
+    target_link_libraries(sshost PRIVATE ss_core SDL2::SDL2-static Qt6::Quick Qt6::Gui Qt6::Qml)
     target_include_directories(sshost PRIVATE core)
-    set_target_properties(sshost PROPERTIES OUTPUT_NAME host)   # ships as host(.exe)
 endif()
