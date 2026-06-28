@@ -45,6 +45,11 @@
 #include <QTimer>
 #include <QColor>
 #include <QScreen>
+#include <QEvent>
+#include <QKeyEvent>
+#include <QMouseEvent>
+#include <QCursor>
+#include <QPoint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -124,6 +129,13 @@ static int32_t g_launchN = 0;                 // seats spawned so far (drives th
 static bool g_invMouseY = false, g_invPadY = false, g_invPadX = false;   // optional per-axis look invert
 static SDL_GameController* g_pads[4] = { nullptr, nullptr, nullptr, nullptr };   // open pads by slot 0..3
 static bool g_mouseFreed = false;             // a menu is up -> stop feeding seat 0 look, free the cursor
+static bool g_enterDown = false;              // Enter currently held (keyboard hold-to-join), via Qt events
+
+// Create-and-join flow state, published by the manager step for the overlay (all touched on the GUI thread).
+static int  g_joinPad = -1, g_joinField = 0, g_joinW1 = 0, g_joinW2 = 0, g_joinCross = 0, g_joinMotion = 0;
+static int  g_joinTaken = 0, g_joinKnown = 0, g_joinHold = 0, g_kbHold = 0, g_joinMode = 0, g_browseIndex = 0;
+static char g_joinVariant[64] = "";
+static ss::ProfileList g_profiles;            // saved configs the browser lists (refreshed on open)
 
 static int LiveCount() { int n = 0; for (auto& c : g_clients) if (c.alive) ++n; return n; }
 static bool PadConnected(int p) { return p >= 0 && p < 4 && g_pads[p] != nullptr; }
@@ -224,11 +236,23 @@ static int SdlXInputMask(SDL_GameController* gc) {
 }
 struct PadEdge { uint16_t prevBtn = 0; bool lt = false, rt = false; };
 static PadEdge g_padEdge[4];
+static uint32_t g_backHold[4] = { 0, 0, 0, 0 };   // BACK held-since timestamp per pad (hold-to-leave)
+static void EnqueueDespawn(uint32_t pid);          // fwd: drop-out kills the seat's process on the worker
 static void FeedGameplay() {
     std::lock_guard<std::mutex> lk(g_clientsLock);
     for (auto& c : g_clients) {
         if (!c.alive || c.pad < 0 || c.pad >= 4 || !g_pads[c.pad]) continue;
         SDL_GameController* gc = g_pads[c.pad];
+        // Hold BACK ~1.2s to leave: the seat despawns and its pad frees.
+        if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_BACK)) {
+            if (!g_backHold[c.pad]) g_backHold[c.pad] = SDL_GetTicks();
+            else if (SDL_GetTicks() - g_backHold[c.pad] > 1200) {
+                g_backHold[c.pad] = 0; uint32_t pid = c.pid;
+                c.alive = false; UnmapSeat(c); c.pid = 0;
+                if (pid) EnqueueDespawn(pid);
+                continue;
+            }
+        } else g_backHold[c.pad] = 0;
         int lx =  SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX);
         int ly = -SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY);   // SDL Y is +down -> flip to +up
         int rx =  SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX);
@@ -373,6 +397,29 @@ static int NextControllerSlot() {
     if (slot < 0 && g_clients.size() < 4) { slot = (int)g_clients.size(); if (slot < 1) slot = 1; }
     return slot;
 }
+static bool Seat0Alive() {
+    std::lock_guard<std::mutex> lk(g_clientsLock);
+    return !g_clients.empty() && g_clients[0].alive && g_clients[0].pad < 0;
+}
+static int LiveCountLocked() { std::lock_guard<std::mutex> lk(g_clientsLock); return LiveCount(); }
+static bool PadAssigned(int pad) {
+    std::lock_guard<std::mutex> lk(g_clientsLock);
+    for (auto& c : g_clients) if (c.alive && c.pad == pad) return true;
+    return false;
+}
+// Names loaded by LIVE seats (so ProfileVariant picks a free variant); returns the count (<= cap).
+static int LiveNames(char buf[][ss::kProfileNameLen], const char* ptrs[], int cap) {
+    int n = 0;
+    std::lock_guard<std::mutex> lk(g_clientsLock);
+    for (auto& c : g_clients)
+        if (c.alive && c.name[0] && n < cap) { snprintf(buf[n], ss::kProfileNameLen, "%s", c.name); ptrs[n] = buf[n]; ++n; }
+    return n;
+}
+static void VariantNameFor(char* out, int cap, const char* base) {
+    char buf[4][ss::kProfileNameLen]; const char* ptrs[4];
+    int n = LiveNames(buf, ptrs, 4);
+    ss::ProfileVariant(out, cap, base, ptrs, n);
+}
 
 // --- render resolution for a seat (monitor size, smart-scaled by seat count) ----------------------
 static void DesiredRes(int liveCount, int& w, int& h) {
@@ -500,6 +547,139 @@ static void UpdateMusicOwner() {
     }
 }
 
+// --- manager step: keyboard hold-to-join, pad reconnect, and the controller join state machine -----
+// Runs each driver tick on the GUI thread (SDL pad state is refreshed there). The pure ss_join state
+// machine decides transitions; this owns the side effects (enqueue spawn, write profile cfg, recall).
+static void EnqueueSpawn(int pad, const char* profile);
+static void ManagerStep() {
+    uint32_t now = SDL_GetTicks();
+    static uint32_t joinPrev[4] = { ss::kPadUnsampled, ss::kPadUnsampled, ss::kPadUnsampled, ss::kPadUnsampled };
+    static uint32_t bannerUntil = 0;
+    static ss::JoinState js;
+    static uint32_t kbHoldStart = 0;
+    static int   stickDir = 0; static uint32_t stickNext = 0;
+    static bool  holdArmed = false; static uint32_t holdStart = 0;
+    static int   lastW1 = -1, lastW2 = -1; static bool known = false;
+    static int   prevMode = ss::JM_EDIT;
+
+    // Keyboard hold-to-join: hold Enter (no kbd/mouse seat + room) for kJoinHoldMs to bring seat 0 up.
+    {
+        bool canKbm = !Seat0Alive() && LiveCountLocked() < 4;
+        int kbHoldMs = 0;
+        if (g_enterDown && canKbm) { if (!kbHoldStart) kbHoldStart = now; kbHoldMs = (int)(now - kbHoldStart); }
+        else kbHoldStart = 0;
+        g_kbHold = canKbm ? ss::JoinHoldPermille(kbHoldMs) : 0;
+        if (kbHoldMs >= ss::kJoinHoldMs) { kbHoldStart = 0; EnqueueSpawn(-1, g_cfg.kbmProfile[0] ? g_cfg.kbmProfile : nullptr); }
+    }
+
+    // Reconnect: a controller that came back (possibly on a new slot) rebinds to the seat whose pad went
+    // away, so unplug/replug resumes that seat instead of stranding the player.
+    int waitingSeat = -1;
+    {
+        std::lock_guard<std::mutex> lk(g_clientsLock);
+        for (size_t i = 0; i < g_clients.size(); ++i)
+            if (g_clients[i].alive && g_clients[i].pad >= 0 && g_clients[i].pad < 4 && !PadConnected(g_clients[i].pad)) { waitingSeat = (int)i; break; }
+    }
+    if (waitingSeat >= 0) {
+        int freePad = -1;
+        for (int p = 0; p < 4; ++p) if (PadConnected(p) && !PadAssigned(p)) { freePad = p; break; }
+        if (freePad >= 0) { std::lock_guard<std::mutex> lk(g_clientsLock); g_clients[waitingSeat].pad = freePad; }
+    }
+
+    // Controller create/join flow. START opens the panel; dpad OR left stick navigate; hold START commits;
+    // B backs out; unplug or a 20s idle aborts. core/ss_join (tested) owns the transitions.
+    bool taken = false;
+    int  joinHoldPm = 0;
+    if (js.pad < 0) {
+        stickDir = 0; lastW1 = -1; lastW2 = -1; known = false;
+        holdArmed = false; holdStart = 0;
+        for (int p = 0; p < 4; ++p) {                    // idle: scan free pads for a fresh START press
+            if (!PadConnected(p) || PadAssigned(p)) { joinPrev[p] = ss::kPadUnsampled; continue; }
+            unsigned b = (unsigned)SdlXInputMask(g_pads[p]), prev = joinPrev[p]; joinPrev[p] = b;
+            bool start = ss::PadButtonPressed(prev, b, 0x0010);   // XINPUT_GAMEPAD_START
+            if (ss::JoinTryStart(js, p, start, LiveCountLocked() < 4)) {
+                bannerUntil = now + 20000;
+                LoadSeatLast(NextControllerSlot(), js);
+                EnumerateProfiles(g_profiles);
+                break;
+            }
+        }
+    } else {
+        bool ok = (js.pad >= 0 && js.pad < 4) && PadConnected(js.pad);
+        SDL_GameController* gc = ok ? g_pads[js.pad] : nullptr;
+        unsigned b = gc ? (unsigned)SdlXInputMask(gc) : 0, prev = joinPrev[js.pad]; joinPrev[js.pad] = b;
+        unsigned nb = b & ~prev;                         // newly pressed this frame
+        int sx = gc ? SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX) : 0;
+        int sy = gc ? -SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY) : 0;   // +up
+        int ax = sx < 0 ? -sx : sx, ay = sy < 0 ? -sy : sy;
+        const int ON = 18000, OFF = 11000;
+        int dir = 0;
+        if (ay >= ax) { if (sy > ON) dir = 1; else if (sy < -ON) dir = 2; }
+        else          { if (sx > ON) dir = 4; else if (sx < -ON) dir = 3; }
+        if (dir == 0 && ax < OFF && ay < OFF) stickDir = 0;
+        int stick = 0;
+        if (dir != 0) {
+            if (dir != stickDir) { stick = dir; stickDir = dir; stickNext = now + 380; }
+            else if (now >= stickNext) { stick = dir; stickNext = now + 130; }
+        }
+        bool startHeld = ok && (b & 0x0010) != 0;
+        if (!startHeld) holdArmed = true;
+        int holdMs = 0;
+        if (holdArmed && startHeld) { if (!holdStart) holdStart = now; holdMs = (int)(now - holdStart); }
+        else holdStart = 0;
+        if (holdMs > 0) bannerUntil = now + 20000;
+        joinHoldPm = ss::JoinHoldPermille(holdMs);
+        if (nb || stick) bannerUntil = now + 20000;
+        ss::JoinInput in;
+        in.newButtons = ss::JoinButtonsFromXInput((int)nb)
+                      | (stick == 3 ? ss::JB_LEFT  : 0) | (stick == 4 ? ss::JB_RIGHT : 0)
+                      | (stick == 1 ? ss::JB_UP    : 0) | (stick == 2 ? ss::JB_DOWN  : 0);
+        in.confirmHoldMs  = (js.mode != ss::JM_VARIANT) ? holdMs : 0;
+        in.connected      = ok;
+        in.timedOut       = (now > bannerUntil);
+        in.word1Count     = ss::ProfileWord1Count();
+        in.word2Count     = ss::ProfileWord2Count();
+        in.crosshairCount = ss::kCrosshairMax + 1;
+        in.profileCount   = g_profiles.count;
+        in.selTaken       = (js.mode == ss::JM_BROWSE && js.browseIndex >= 0 && js.browseIndex < g_profiles.count)
+                            ? NameInUse(g_profiles.names[js.browseIndex]) : false;
+        char curName[64]; ss::ProfileComposeName(curName, sizeof(curName), js.word1, js.word2);
+        in.nameInUse = NameInUse(curName);
+        taken = in.nameInUse;
+        ss::JoinResult r = ss::JoinAdvance(js, in);
+        if (r.action == ss::JoinAction::Join) {
+            int slot = NextControllerSlot();
+            char base[64], nm[64]; int ch = r.crosshair, mo = r.motion;
+            if (r.fromBrowse && r.browseIndex >= 0 && r.browseIndex < g_profiles.count) {
+                snprintf(base, sizeof(base), "%s", g_profiles.names[r.browseIndex]);
+                LoadProfileCfg(base, &ch, &mo);
+            } else {
+                ss::ProfileComposeName(base, sizeof(base), r.word1, r.word2);
+            }
+            if (r.variant)         { VariantNameFor(nm, sizeof(nm), base); WriteProfileCfg(nm, ch, mo); }
+            else if (r.fromBrowse) { snprintf(nm, sizeof(nm), "%s", base); }
+            else                   { snprintf(nm, sizeof(nm), "%s", base); WriteProfileCfg(nm, ch, mo); }
+            EnqueueSpawn(r.pad, nm);
+            if (!r.fromBrowse) SaveSeatLast(slot, r.word1, r.word2, r.crosshair, r.motion);
+        }
+        if (js.mode == ss::JM_BROWSE && prevMode != ss::JM_BROWSE) EnumerateProfiles(g_profiles);
+        if (js.mode == ss::JM_VARIANT) { holdArmed = false; holdStart = 0; }
+        prevMode = js.mode;
+        if (js.pad >= 0 && (js.word1 != lastW1 || js.word2 != lastW2)) {   // returning-player settings reload
+            lastW1 = js.word1; lastW2 = js.word2;
+            char ln[64]; ss::ProfileComposeName(ln, sizeof(ln), js.word1, js.word2);
+            int lc, lm; known = LoadProfileCfg(ln, &lc, &lm);
+            if (known) { js.crosshair = lc; js.motion = lm; }
+        }
+        if (js.mode == ss::JM_VARIANT) VariantNameFor(g_joinVariant, sizeof(g_joinVariant), curName);
+        else g_joinVariant[0] = '\0';
+    }
+    // publish for the overlay (GUI thread)
+    g_joinPad = js.pad; g_joinField = js.field; g_joinW1 = js.word1; g_joinW2 = js.word2;
+    g_joinCross = js.crosshair; g_joinMotion = js.motion; g_joinTaken = taken; g_joinKnown = known;
+    g_joinHold = joinHoldPm; g_joinMode = js.mode; g_browseIndex = js.browseIndex;
+}
+
 // --- the Qt Quick compositor: one item per seat -------------------------------------------------
 class SeatItem : public QQuickItem {
     Q_OBJECT
@@ -535,6 +715,67 @@ protected:
     }
 private:
     int m_seat = -1;
+};
+
+// --- seat-0 keyboard/mouse routing (Qt events) --------------------------------------------------
+// Extended keys carry the DIK high bit (0x80); the engine expects DirectInput scancodes. (Windows
+// nativeScanCode covers the rest; mac scancode semantics need validation alongside the mac capture hook.)
+static int QtKeyToDikExt(int key) {
+    switch (key) {
+        case Qt::Key_Up: return 0xC8; case Qt::Key_Down: return 0xD0;
+        case Qt::Key_Left: return 0xCB; case Qt::Key_Right: return 0xCD;
+        case Qt::Key_Home: return 0xC7; case Qt::Key_End: return 0xCF;
+        case Qt::Key_PageUp: return 0xC9; case Qt::Key_PageDown: return 0xD1;
+        case Qt::Key_Insert: return 0xD2; case Qt::Key_Delete: return 0xD3;
+        default: return 0;
+    }
+}
+static int QtKeyToGui(int key) {
+    switch (key) {
+        case Qt::Key_Escape: return 27; case Qt::Key_Return: case Qt::Key_Enter: return 13; case Qt::Key_Tab: return 9;
+        case Qt::Key_Backspace: return 8; case Qt::Key_Delete: return 26;
+        case Qt::Key_Up: return 11; case Qt::Key_Down: return 10; case Qt::Key_Left: return 5; case Qt::Key_Right: return 6;
+        case Qt::Key_PageUp: return 2; case Qt::Key_PageDown: return 1; case Qt::Key_Home: return 3; case Qt::Key_End: return 4;
+        default: return 0;
+    }
+}
+// App-level filter: routes keyboard + mouse buttons to seat 0 (the kbd/mouse player), and tracks Enter
+// for keyboard hold-to-join. Look (relative mouse) is handled by the driver's cursor re-center.
+class InputFilter : public QObject {
+    Q_OBJECT
+protected:
+    bool eventFilter(QObject* o, QEvent* e) override {
+        switch (e->type()) {
+            case QEvent::KeyPress: case QEvent::KeyRelease: {
+                QKeyEvent* k = static_cast<QKeyEvent*>(e);
+                bool down = (e->type() == QEvent::KeyPress);
+                if (k->key() == Qt::Key_Return || k->key() == Qt::Key_Enter) g_enterDown = down;
+                if (k->isAutoRepeat()) break;
+                int sc = QtKeyToDikExt(k->key()); if (!sc) sc = (int)(k->nativeScanCode() & 0xFF);
+                int gk = QtKeyToGui(k->key());
+                std::lock_guard<std::mutex> lk(g_clientsLock);
+                if (!g_clients.empty() && g_clients[0].alive && g_clients[0].pad < 0) {
+                    if (sc || gk) PushKey(g_clients[0], sc, gk, 0, down ? 1 : 0);
+                    if (down) { QByteArray t = k->text().toLatin1(); for (char ch : t) if ((unsigned char)ch >= ' ') PushKey(g_clients[0], 0, 0, (unsigned char)ch, 1); }
+                }
+                break;
+            }
+            case QEvent::MouseButtonPress: case QEvent::MouseButtonRelease: {
+                if (g_mouseFreed) break;
+                QMouseEvent* m = static_cast<QMouseEvent*>(e);
+                int code = (m->button() == Qt::LeftButton) ? 0x100 : (m->button() == Qt::RightButton) ? 0x101 : (m->button() == Qt::MiddleButton) ? 0x102 : 0;
+                if (code) {
+                    std::lock_guard<std::mutex> lk(g_clientsLock);
+                    if (!g_clients.empty() && g_clients[0].alive && g_clients[0].pad < 0)
+                        PushKey(g_clients[0], code, 0, 0, e->type() == QEvent::MouseButtonPress ? 1 : 0);
+                }
+                break;
+            }
+            default: break;
+        }
+        (void)o;
+        return false;   // never consume -- let Qt handle the window normally too
+    }
 };
 
 static void ParseEnv() {
@@ -577,16 +818,21 @@ int main(int argc, char** argv) {
 
     std::thread worker(WorkerMain);   // server bring-up + spawns run here (off the GUI loop)
 
+    InputFilter inputFilter;
+    app.installEventFilter(&inputFilter);   // seat-0 keyboard/mouse + Enter hold-to-join
+
     QQuickWindow window;
     window.setTitle("splitdronum");
     window.setColor(QColor(0, 0, 0));
     window.resize(1280, 720);
+    window.setCursor(Qt::BlankCursor);
     QQuickItem* root = window.contentItem();
     SeatItem* seats[4];
     for (int i = 0; i < 4; ++i) { seats[i] = new SeatItem(root); seats[i]->setSeat(i); seats[i]->setVisible(false); }
     window.show();
 
-    // ~60 Hz driver (GUI thread): poll pads, feed gameplay, reap, music handoff, then re-tile + repaint.
+    // ~60 Hz driver (GUI thread): poll pads, feed gameplay, run the manager step (join/keyboard), reap,
+    // music handoff, relative-mouse look, then re-tile + repaint.
     QTimer driver;
     QObject::connect(&driver, &QTimer::timeout, [&]() {
         SDL_GameControllerUpdate();
@@ -596,8 +842,32 @@ int main(int argc, char** argv) {
             else if (e.type == SDL_CONTROLLERDEVICEREMOVED) OnControllerRemoved(e.cdevice.which);
         }
         FeedGameplay();
+        ManagerStep();
         ReapDeadSeats();
         UpdateMusicOwner();
+
+        // free the mouse when seat 0 is in a menu/console, or when every live seat is (nobody playing);
+        // otherwise capture it for seat-0 look by re-centering the cursor and feeding the delta.
+        {
+            std::lock_guard<std::mutex> lk(g_clientsLock);
+            bool seat0Menu = !g_clients.empty() && g_clients[0].in && g_clients[0].in[IN_MENU] != 0;
+            bool allMenu = true;
+            for (auto& c : g_clients) if (c.alive && !(c.in && c.in[IN_MENU] != 0)) { allMenu = false; break; }
+            g_mouseFreed = seat0Menu || allMenu;
+        }
+        bool active = window.isActive();
+        if (active && !g_mouseFreed && Seat0Alive()) {
+            QPoint center(window.x() + (int)window.width() / 2, window.y() + (int)window.height() / 2);
+            QPoint cur = QCursor::pos();
+            int dx = cur.x() - center.x(), dy = cur.y() - center.y();
+            if (dx || dy) {
+                std::lock_guard<std::mutex> lk(g_clientsLock);
+                if (!g_clients.empty() && g_clients[0].alive && g_clients[0].pad < 0)
+                    PushMouse(g_clients[0], dx, g_invMouseY ? dy : -dy);
+                QCursor::setPos(center);
+            }
+        }
+
         int W = (int)window.width(), H = (int)window.height();
         ss::Rect paneFor[4]; bool show[4] = { false, false, false, false };
         {
