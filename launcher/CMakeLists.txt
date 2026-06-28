@@ -27,9 +27,13 @@ if(WIN32)
     set_target_properties(launcher PROPERTIES WIN32_EXECUTABLE TRUE)   # no console window
 endif()
 
-# drop launcher.exe straight into <repo>/build (next to host.exe), for every config
-set(OUT ${CMAKE_CURRENT_SOURCE_DIR}/../build)
-set_target_properties(launcher PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY         ${OUT}
-    RUNTIME_OUTPUT_DIRECTORY_RELEASE ${OUT}
-    RUNTIME_OUTPUT_DIRECTORY_DEBUG   ${OUT})
+# When built STANDALONE (build-launcher.ps1), drop launcher.exe straight into <repo>/build next to host.exe.
+# When built as part of the root CMake project, leave the default output dir -- forcing ../build there would
+# collide with the build/launcher subdir CMake creates for this target (the executable path resolves to '.').
+if(PROJECT_IS_TOP_LEVEL)
+    set(OUT ${CMAKE_CURRENT_SOURCE_DIR}/../build)
+    set_target_properties(launcher PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY         ${OUT}
+        RUNTIME_OUTPUT_DIRECTORY_RELEASE ${OUT}
+        RUNTIME_OUTPUT_DIRECTORY_DEBUG   ${OUT})
+endif()
