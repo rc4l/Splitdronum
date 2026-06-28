@@ -30,11 +30,12 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           f="$QT_ROOT_DIR/lib/cmake/Qt6/FindWrapOpenGL.cmake"
-          # Qt's WrapOpenGL falls back to linking '-framework AGL' when AGL isn't found -- and it never is on
-          # current macOS SDKs, so the link breaks. Drop just that AGL link line; OpenGL.framework still links
-          # and Qt Quick uses Metal, so nothing actually needs AGL.
+          # On current macOS SDK + newer CMake, Qt 6.8's WrapOpenGL (a) derives a bogus OpenGL framework path
+          # (a bare '.', -> ld errno=21) and (b) falls back to linking the removed '-framework AGL'. Qt Quick
+          # uses Metal and needs neither at runtime, so force a clean OpenGL framework link and drop AGL.
+          sed -i '' 's|INTERFACE ${__opengl_fw_path})|INTERFACE "-framework OpenGL")|' "$f"
           sed -i '' '/INTERFACE ${__opengl_agl_fw_path})/d' "$f"
-          echo "remaining AGL link refs:"; grep -n "agl_fw_path" "$f" || echo "(none on the link line -- fixed)"
+          echo "WrapOpenGL link lines:"; grep -n "WrapOpenGL::WrapOpenGL INTERFACE" "$f"
 
       # macOS target = x86_64 to MATCH the engine, which ships Intel-only (Apple Silicon arm64 has no
       # working Zandronum audio). Uniform arch under Rosetta keeps host<->engine shared memory simple.
