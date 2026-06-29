@@ -58,6 +58,7 @@
 #include <QVariantList>
 #include <QFileInfo>
 #include <QStringList>
+#include <QString>
 #include <QCoreApplication>
 #include <cstdio>
 #include <cstdlib>
@@ -69,6 +70,7 @@
 #include <condition_variable>
 #include <thread>
 #include <chrono>
+#include <atomic>
 #include "../core/ss_layout.h"
 #include "../core/ss_join.h"
 #include "../core/ss_profile.h"
@@ -139,6 +141,8 @@ static int32_t g_launchN = 0;                 // seats spawned so far (drives th
 static bool g_invMouseY = false, g_invPadY = false, g_invPadX = false;   // optional per-axis look invert
 static SDL_GameController* g_pads[4] = { nullptr, nullptr, nullptr, nullptr };   // open pads by slot 0..3
 static bool g_mouseFreed = false;             // a menu is up -> stop feeding seat 0 look, free the cursor
+static std::atomic<bool> g_captureMouse{false};   // seat-0 look is live: feed mouse-move deltas + re-center
+static int  g_winCx = 0, g_winCy = 0;         // window center in screen coords (driver updates; filter reads)
 static bool g_enterDown = false;              // Enter currently held (keyboard hold-to-join), via Qt events
 static bool g_kbmEverUp = false;              // a kbd/mouse seat 0 has existed (gate the "seat 0 left" prompt)
 
@@ -151,6 +155,7 @@ static ss::ProfileList g_profiles;            // saved configs the browser lists
 // that got stuck -- e.g. alt-tab (or cmd-tab on macOS) sends Alt-down (=+strafe) but focus leaves before
 // the Alt-up, leaving strafe held so mouse-X strafes instead of turning. Touched on the GUI thread only.
 static unsigned char g_seat0Down[0x200];
+static std::atomic<int> g_frameCount{0};      // composited frames since the last fps title update (render thread bumps it)
 
 static int LiveCount() { int n = 0; for (auto& c : g_clients) if (c.alive) ++n; return n; }
 static bool PadConnected(int p) { return p >= 0 && p < 4 && g_pads[p] != nullptr; }
@@ -846,6 +851,23 @@ protected:
                 }
                 break;
             }
+            case QEvent::MouseMove: {
+                // Event-driven seat-0 look: update per OS mouse event (native ~1 kHz), not the 60 Hz timer,
+                // so motion is smooth on a high-refresh display. Re-center after each delta; the synthetic
+                // move our own warp generates lands on center (delta 0) and is skipped.
+                if (!g_captureMouse.load(std::memory_order_relaxed)) break;
+                QMouseEvent* m = static_cast<QMouseEvent*>(e);
+                QPoint gp = m->globalPosition().toPoint();
+                int dx = gp.x() - g_winCx, dy = gp.y() - g_winCy;
+                if (dx == 0 && dy == 0) break;
+                {
+                    std::lock_guard<std::mutex> lk(g_clientsLock);
+                    if (!g_clients.empty() && g_clients[0].alive && g_clients[0].pad < 0)
+                        PushMouse(g_clients[0], dx, g_invMouseY ? dy : -dy);
+                }
+                QCursor::setPos(g_winCx, g_winCy);
+                break;
+            }
             case QEvent::MouseButtonPress: case QEvent::MouseButtonRelease: {
                 if (g_mouseFreed) break;
                 QMouseEvent* m = static_cast<QMouseEvent*>(e);
@@ -986,6 +1008,15 @@ int main(int argc, char** argv) {
     SeatItem* seats[4];
     for (int i = 0; i < 4; ++i) { seats[i] = new SeatItem(root); seats[i]->setSeat(i); seats[i]->setVisible(false); }
     InitOverlay(window);   // load qml/Overlay.qml on top of the seats (optional -- host runs without it)
+    // fps counter in the title bar (parity with the legacy host). frameSwapped fires on the render thread
+    // after each present, so bump an atomic; the driver turns it into "N fps" once a second.
+    QObject::connect(&window, &QQuickWindow::frameSwapped, &window,
+                     []() { g_frameCount.fetch_add(1, std::memory_order_relaxed); }, Qt::DirectConnection);
+    // Render at the monitor's refresh (vsync), not the 16 ms logic timer: after each presented frame,
+    // request the next one. Without this the compositor is capped to ~60 fps regardless of a 480 Hz display.
+    QObject::connect(&window, &QQuickWindow::frameSwapped, &window,
+                     [&]() { for (int i = 0; i < 4; ++i) if (seats[i]->isVisible()) seats[i]->update(); },
+                     Qt::QueuedConnection);
     window.show();
     window.requestActivate();
 #ifdef _WIN32
@@ -999,6 +1030,7 @@ int main(int argc, char** argv) {
 #endif
     bool lookPrimed = false;   // skip the first cursor delta after (re)gaining capture (avoids a jump)
     bool wasActive  = true;    // track focus transitions to release seat-0 keys on focus loss
+    uint32_t fpsT0  = SDL_GetTicks();   // window-title fps counter window start
 
     // ~60 Hz driver (GUI thread): poll pads, feed gameplay, run the manager step (join/keyboard), reap,
     // music handoff, relative-mouse look, then re-tile + repaint.
@@ -1026,7 +1058,13 @@ int main(int argc, char** argv) {
             for (auto& c : g_clients) if (c.alive && !(c.in && c.in[IN_MENU] != 0)) { allMenu = false; break; }
             g_mouseFreed = seat0Menu || allMenu;
         }
+        // Focus = the OS foreground window IS ours. (Qt's isActive() can lag an alt-tab, leaving the cursor
+        // captured + re-centered so it feels "stuck" until you Escape into a menu -- use the OS truth.)
+#ifdef _WIN32
+        bool active = (GetForegroundWindow() == winHandle);
+#else
         bool active = window.isActive();
+#endif
         // Auto-release stuck seat-0 modifiers (cross-platform): ask the OS for the real modifier state and
         // release any modifier the host still holds that is no longer physically down. This self-heals the
         // stuck-strafe bug (alt-tab / cmd-tab leaves Alt=+strafe held). On focus loss, release everything
@@ -1045,21 +1083,14 @@ int main(int argc, char** argv) {
 
         bool capture = active && !g_mouseFreed && Seat0Alive();
         ClipCursorToWindow(winHandle, capture);
+        g_winCx = window.x() + (int)window.width() / 2;   // publish center for the event-driven look
+        g_winCy = window.y() + (int)window.height() / 2;
         if (capture) {
-            QPoint center(window.x() + (int)window.width() / 2, window.y() + (int)window.height() / 2);
-            if (!lookPrimed) { QCursor::setPos(center); lookPrimed = true; }   // arm without a jump
-            else {
-                QPoint cur = QCursor::pos();
-                int dx = cur.x() - center.x(), dy = cur.y() - center.y();
-                if (dx || dy) {
-                    std::lock_guard<std::mutex> lk(g_clientsLock);
-                    if (!g_clients.empty() && g_clients[0].alive && g_clients[0].pad < 0)
-                        PushMouse(g_clients[0], dx, g_invMouseY ? dy : -dy);
-                    QCursor::setPos(center);
-                }
-            }
+            if (!lookPrimed) { QCursor::setPos(g_winCx, g_winCy); lookPrimed = true; }   // arm without a jump
+            g_captureMouse.store(true, std::memory_order_relaxed);
         } else {
             lookPrimed = false;
+            g_captureMouse.store(false, std::memory_order_relaxed);
         }
 
         int W = (int)window.width(), H = (int)window.height();
@@ -1097,6 +1128,14 @@ int main(int argc, char** argv) {
             }
         }
         UpdateOverlay(W, H, joinArea, joinSeatPane, disconnects);
+
+        uint32_t nowMs = SDL_GetTicks();   // refresh the title-bar fps once a second
+        if (nowMs - fpsT0 >= 1000) {
+            int f = g_frameCount.exchange(0, std::memory_order_relaxed);
+            int fps = (int)((long long)f * 1000 / (nowMs - fpsT0));
+            window.setTitle(QString("splitdronum  -  %1 fps").arg(fps));
+            fpsT0 = nowMs;
+        }
     });
     driver.start(16);
 
