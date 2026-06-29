@@ -1,7 +1,7 @@
 // host_qt -- the cross-platform splitscreen host/compositor (Windows + macOS).
 //
-// This is the multiplatform replacement for host/host.cpp (the legacy Win32/D3D11 host). It does the
-// same job -- launch N stock Zandronum clients, read each client's framebuffer from shared memory, and
+// The splitscreen host/compositor. (Replaced an earlier Win32/D3D11 host, now retired.) It does the
+// job -- launch N stock Zandronum clients, read each client's framebuffer from shared memory, and
 // composite them into ONE window with the QML overlay on top -- but on a portable stack:
 //
 //   window + compositor + overlay : Qt Quick. One QML scene draws the seat framebuffers AND the overlay,

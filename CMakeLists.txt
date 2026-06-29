@@ -42,9 +42,8 @@ endif()
 #     build stays dependency-free; CI turns it on with -DSS_BUILD_HOST=ON. Qt Quick is the compositor:
 #     it renders the seat framebuffers AND the QML overlay in one scene, on Qt's RHI (D3D11 on Windows,
 #     Metal on macOS) -- so there is no platform-specific GPU code. SDL2 is fetched + built STATIC and
-#     used ONLY for gamepad input (Qt 6 has no gamepad module); no SDL window or renderer. The legacy
-#     Win32/D3D11 host (host/host.cpp) stays during the port; this is the multiplatform target the
-#     release pipeline packages. ---
+#     used ONLY for gamepad input (Qt 6 has no gamepad module); no SDL window or renderer. This is the
+#     multiplatform host the release pipeline packages (the old Win32/D3D11 host has been retired). ---
 option(SS_BUILD_HOST "Build the cross-platform Qt host/compositor (requires Qt6; fetches SDL2 for pads)" OFF)
 if(SS_BUILD_HOST)
     include(FetchContent)
@@ -58,7 +57,11 @@ if(SS_BUILD_HOST)
 
     find_package(Qt6 REQUIRED COMPONENTS Quick Gui Qml)
 
-    add_executable(sshost host/host_qt.cpp)
+    set(SS_HOST_SOURCES host/host_qt.cpp)
+    if(WIN32)
+        list(APPEND SS_HOST_SOURCES host/host.rc)   # app/window icon (the splitdronum skull)
+    endif()
+    add_executable(sshost ${SS_HOST_SOURCES})
     set_target_properties(sshost PROPERTIES AUTOMOC ON OUTPUT_NAME host)   # ships as host(.exe)
     target_link_libraries(sshost PRIVATE ss_core SDL2::SDL2-static Qt6::Quick Qt6::Gui Qt6::Qml)
     target_include_directories(sshost PRIVATE core)

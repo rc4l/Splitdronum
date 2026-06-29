@@ -25,10 +25,8 @@ param(
     [switch]$NoAutoStartKBM,     # default (absent): start immediately with keyboard+mouse as Player 1.
                                  # present: open on a "press anything to start" screen -- first input claims P1.
                                  # (a switch, not a [bool], so it survives `powershell -File` from the launcher.)
-    [string]$KbmProfile = '',    # the saved profile the keyboard+mouse seat 0 loads (blank = default identity).
-                                 # the launcher passes the chosen config here when several exist.
-    [switch]$LegacyHost          # use the pre-convergence Win32/D3D11 host (host-legacy.exe) instead of the
-)                                # default cross-platform Qt host. Fallback during convergence.
+    [string]$KbmProfile = ''     # the saved profile the keyboard+mouse seat 0 loads (blank = default identity).
+)                                # the launcher passes the chosen config here when several exist.
 $root = $PSScriptRoot
 if ($MouseInvertY) { $env:SS_MOUSE_INVY = '1' } else { Remove-Item Env:\SS_MOUSE_INVY -ErrorAction SilentlyContinue }
 if ($PadInvertY)   { $env:SS_PAD_INVY   = '1' } else { Remove-Item Env:\SS_PAD_INVY   -ErrorAction SilentlyContinue }
@@ -73,9 +71,7 @@ if (-not (Test-Path $GamePath)) { Write-Host "ERROR: zandronum.exe not found at 
 $GamePath = (Resolve-Path $GamePath).Path
 $gameDir  = Split-Path $GamePath
 $dll = Join-Path $root 'build\ss_hook.dll'
-# Convergence: the cross-platform Qt host is the default; -LegacyHost falls back to the old Win32 host.
-if ($LegacyHost) { $exe = Join-Path $root 'build\host-legacy.exe'; $buildHost = 'build-host-legacy.ps1' }
-else             { $exe = Join-Path $root 'build\host.exe';        $buildHost = 'build-host.ps1' }
+$exe = Join-Path $root 'build\host.exe'   # the cross-platform Qt host (built by build-host.ps1)
 $preferredCfg = Join-Path $root 'seats_preferred.cfg'  # baseline applied to every seat (a profile overrides it)
 $absoluteCfg  = Join-Path $root 'seats_absolute.cfg'   # absolute override -- execed last, wins over everything
 
@@ -83,7 +79,7 @@ $absoluteCfg  = Join-Path $root 'seats_absolute.cfg'   # absolute override -- ex
 # bakes in engine symbol RVAs; if the engine differs from what the DLL was built against, its hooks land
 # on wrong addresses and input dies silently -- so a fresh private engine always forces a DLL rebuild.
 if ($engineFresh -or -not (Test-Path $dll)) { & (Join-Path $root 'build-dll.ps1')  -GamePath $GamePath }
-if (-not (Test-Path $exe)) { & (Join-Path $root $buildHost) }
+if (-not (Test-Path $exe)) { & (Join-Path $root 'build-host.ps1') }
 if (-not (Test-Path $dll) -or -not (Test-Path $exe)) { Write-Host 'ERROR: build failed.'; exit 1 }
 
 Write-Host "launching $Players-player splitscreen (seat 0 = kbd/mouse, seats 1+ = controllers)..."

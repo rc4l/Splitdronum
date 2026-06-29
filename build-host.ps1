@@ -1,7 +1,7 @@
 # Build the cross-platform Qt host/compositor (host.exe): host/host_qt.cpp built via the root CMake
 # project (-DSS_BUILD_HOST=ON), which also fetches + builds SDL2 (static, gamepads only) and links Qt6.
 # Qt Quick is the compositor: it draws the seat framebuffers AND the QML overlay in one scene on Qt's RHI
-# (D3D11 here). This is the convergence default; the legacy Win32/D3D11 host is build-host-legacy.ps1.
+# (D3D11 on Windows, Metal on macOS). This is the host -- the legacy Win32/D3D11 host has been retired.
 # Output: build\host.exe + the Qt runtime staged beside it. Discovers CMake (PATH, else VS's bundled one)
 # and Qt under deps\qt.
 $ErrorActionPreference = 'Continue'
