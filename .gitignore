@@ -16,3 +16,7 @@ engine/
 
 # packaged engine release asset (built by package-engine.ps1, uploaded to a GitHub Release)
 engine.zip
+
+# downloaded CI/release packages (inspection only -- never commit)
+ssdl_art/
+splitdronum-*.zip

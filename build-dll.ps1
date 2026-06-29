@@ -1,4 +1,4 @@
-# Build the injected DLL (ss_hook.dll) + the injector (inject.exe). Portable: discovers the
+# Build the injected DLL (ss_hook.dll). Portable: discovers the
 # VS2022 x64 toolchain via vswhere; no machine paths. Engine symbol RVAs are extracted from the
 # *built* zandronum.exe at build time (gen_offsets -> dll\ss_offsets.h) so the DLL resolves them
 # as (module base + RVA) at runtime with NO fragile runtime DbgHelp. Pass -GamePath if your
@@ -20,7 +20,6 @@ $inc   = Join-Path $root 'third_party\minhook\include'
 $mh    = Join-Path $root 'third_party\minhook\src'
 $mhSrc = @("$mh\buffer.c", "$mh\hook.c", "$mh\trampoline.c", "$mh\hde\hde32.c", "$mh\hde\hde64.c")
 $dll   = Join-Path $root 'dll\ss_hook.cpp'
-$inj   = Join-Path $root 'host\inject.cpp'
 $gen   = Join-Path $root 'tools\gen_offsets.cpp'
 $offh  = Join-Path $root 'dll\ss_offsets.h'
 
@@ -40,7 +39,3 @@ Write-Host ("ss_offsets.h: " + (Test-Path $offh))
 $srcs = (@($dll) + $mhSrc | ForEach-Object { '"' + $_ + '"' }) -join ' '
 cmd /c "`"$vcvars`" >nul && cd /d `"$out`" && cl /nologo /LD /O2 /I `"$inc`" /Fe:ss_hook.dll $srcs opengl32.lib user32.lib winmm.lib"
 Write-Host ("ss_hook.dll: " + (Test-Path (Join-Path $out 'ss_hook.dll')))
-
-# --- 3. injector ---
-cmd /c "`"$vcvars`" >nul && cd /d `"$out`" && cl /nologo /O2 /Fe:inject.exe `"$inj`""
-Write-Host ("inject.exe: " + (Test-Path (Join-Path $out 'inject.exe')))
