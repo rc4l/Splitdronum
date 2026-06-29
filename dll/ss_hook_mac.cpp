@@ -23,6 +23,7 @@
 //
 // Runtime needs a Mac + the Intel engine + real offsets (gen_offsets_mac). CI verifies it COMPILES.
 #include <SDL.h>
+#define GL_SILENCE_DEPRECATION   // macOS deprecated the OpenGL API headers; the engine still uses GL, so do we
 #include <OpenGL/gl.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
