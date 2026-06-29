@@ -70,6 +70,30 @@ inline ShmView ShmOpenRead(const char* name) {
     return v;
 }
 
+// Open an EXISTING section read/write (does NOT create or unlink). Used by the injected capture hook to
+// access the host-created input channel ("ZanIN_<pid>"): it writes IN_MENU back and consumes mouse deltas.
+inline ShmView ShmOpenRW(const char* name) {
+    ShmView v;
+#ifdef _WIN32
+    HANDLE h = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, name);
+    if (!h) return v;
+    void* p = MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, 0);
+    if (!p) { CloseHandle(h); return v; }
+    v.handle = h; v.ptr = p; v.size = 0;
+#else
+    char pn[64]; ShmPosixName(pn, sizeof(pn), name);
+    int fd = shm_open(pn, O_RDWR, 0);
+    if (fd < 0) return v;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size == 0) { close(fd); return v; }
+    void* p = mmap(nullptr, (size_t)st.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED) { close(fd); return v; }
+    v.fd = fd; v.ptr = p; v.size = (size_t)st.st_size;   // creator stays false -> no unlink on close
+    snprintf(v.name, sizeof(v.name), "%s", pn);
+#endif
+    return v;
+}
+
 // Create (or open) a section read/write of exactly `bytes`. Used for the host->client input channel.
 inline ShmView ShmCreate(const char* name, size_t bytes) {
     ShmView v;

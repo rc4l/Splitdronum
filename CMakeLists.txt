@@ -45,7 +45,15 @@ endif()
 #     used ONLY for gamepad input (Qt 6 has no gamepad module); no SDL window or renderer. This is the
 #     multiplatform host the release pipeline packages (the old Win32/D3D11 host has been retired). ---
 option(SS_BUILD_HOST "Build the cross-platform Qt host/compositor (requires Qt6; fetches SDL2 for pads)" OFF)
-if(SS_BUILD_HOST)
+# --- the macOS engine capture dylib (dll/ss_hook_mac.cpp). Compile-check target: it injects into the
+#     stock engine at runtime (DYLD_INSERT_LIBRARIES) and resolves SDL/GL from the engine, so here we
+#     only verify it compiles + links (with -undefined dynamic_lookup). The real deploy build is
+#     build-dll.sh (which also extracts engine offsets via gen_offsets_mac). ---
+option(SS_BUILD_HOOK "Build the macOS capture dylib (compile check; macOS only)" OFF)
+
+# SDL2 (static): the host links it for gamepads; the mac hook only uses its HEADERS (SDL resolves from
+# the engine at runtime). Fetch once if either target needs it.
+if(SS_BUILD_HOST OR (SS_BUILD_HOOK AND APPLE))
     include(FetchContent)
     set(SDL_SHARED      OFF CACHE BOOL "" FORCE)   # static: fold SDL into the host binary
     set(SDL_STATIC      ON  CACHE BOOL "" FORCE)
@@ -54,7 +62,9 @@ if(SS_BUILD_HOST)
     FetchContent_Declare(SDL2
         URL https://github.com/libsdl-org/SDL/releases/download/release-2.30.9/SDL2-2.30.9.tar.gz)
     FetchContent_MakeAvailable(SDL2)
+endif()
 
+if(SS_BUILD_HOST)
     find_package(Qt6 REQUIRED COMPONENTS Quick Gui Qml)
 
     set(SS_HOST_SOURCES host/host_qt.cpp)
@@ -65,4 +75,25 @@ if(SS_BUILD_HOST)
     set_target_properties(sshost PROPERTIES AUTOMOC ON OUTPUT_NAME host)   # ships as host(.exe)
     target_link_libraries(sshost PRIVATE ss_core SDL2::SDL2-static Qt6::Quick Qt6::Gui Qt6::Qml)
     target_include_directories(sshost PRIVATE core)
+endif()
+
+if(SS_BUILD_HOOK AND APPLE)
+    # ss_offsets.h is generated from the engine (build-dll.sh). For a compile check without the engine,
+    # fall back to a zeroed stub so the source builds; the real header replaces it at deploy time.
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/dll/ss_offsets.h)
+        set(SS_OFFSETS_INC ${CMAKE_CURRENT_SOURCE_DIR}/dll)
+    else()
+        set(SS_OFFSETS_INC ${CMAKE_BINARY_DIR}/ss_offsets_stub)
+        file(WRITE ${SS_OFFSETS_INC}/ss_offsets.h
+            "#pragma once\n"
+            "#define SS_RVA_D_PostEvent 0ULL\n#define SS_RVA_menuactive 0ULL\n"
+            "#define SS_RVA_ConsoleState 0ULL\n#define SS_RVA_GUICapture 0ULL\n"
+            "#define SS_RVA_g_ulChatMode 0ULL\n#define SS_RVA_AppActive 0ULL\n"
+            "#define SS_RVA_AddCommandString 0ULL\n")
+    endif()
+    add_library(sshook MODULE dll/ss_hook_mac.cpp)
+    set_target_properties(sshook PROPERTIES OUTPUT_NAME ss_hook SUFFIX ".dylib" OSX_ARCHITECTURES x86_64)
+    target_include_directories(sshook PRIVATE ${sdl2_SOURCE_DIR}/include ${SS_OFFSETS_INC} dll host)
+    target_link_libraries(sshook PRIVATE "-framework OpenGL")
+    target_link_options(sshook PRIVATE -undefined dynamic_lookup)
 endif()
