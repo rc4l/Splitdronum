@@ -120,6 +120,8 @@ struct HostConfig {
 static HostConfig g_cfg;
 static int g_port = 10666;              // loopback server/connect port; resolved to a free one at startup
 static int g_screenW = 1920, g_screenH = 1080;   // captured from QScreen on the GUI thread (DesiredRes)
+static int g_fpsCap = -1;               // SS_FPS (launcher dropdown): -1/auto = refresh (vsync), 0 = uncapped
+                                        // (also vsync-capped), N = pace the compositor to N fps
 
 // --- a composited client seat (portable; mirrors the Win32 host's Client) --------------------------
 struct Client {
@@ -957,6 +959,9 @@ static void ParseEnv() {
     if (const char* as = getenv("SS_AUTOSTART"); as && as[0] == '0') g_autoStart = false;
     if (const char* kp = getenv("SS_KBM_PROFILE"); kp && kp[0])
         snprintf(g_cfg.kbmProfile, sizeof(g_cfg.kbmProfile), "%s", kp);
+    // SS_FPS mirrors the launcher's fps dropdown (play.ps1 -Fps): "auto" = refresh, "0" = uncapped, "N" = cap.
+    // The clients honor it via the DLL; the compositor honors it here so the setting is consistent end-to-end.
+    if (const char* fp = getenv("SS_FPS")) g_fpsCap = (strcmp(fp, "auto") == 0) ? -1 : atoi(fp);
 }
 
 int main(int argc, char** argv) {
@@ -978,6 +983,7 @@ int main(int argc, char** argv) {
     // we own the console, never a shell we were launched into interactively.
     { DWORD cpl[2]; if (GetConsoleProcessList(cpl, 2) == 1) ShowWindow(GetConsoleWindow(), SW_HIDE); }
     WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
+    timeBeginPeriod(1);   // 1ms scheduler tick so a custom-fps render timer paces accurately
 #endif
     SDL_SetMainReady();
     SDL_Init(SDL_INIT_GAMECONTROLLER);
@@ -1012,11 +1018,6 @@ int main(int argc, char** argv) {
     // after each present, so bump an atomic; the driver turns it into "N fps" once a second.
     QObject::connect(&window, &QQuickWindow::frameSwapped, &window,
                      []() { g_frameCount.fetch_add(1, std::memory_order_relaxed); }, Qt::DirectConnection);
-    // Render at the monitor's refresh (vsync), not the 16 ms logic timer: after each presented frame,
-    // request the next one. Without this the compositor is capped to ~60 fps regardless of a 480 Hz display.
-    QObject::connect(&window, &QQuickWindow::frameSwapped, &window,
-                     [&]() { for (int i = 0; i < 4; ++i) if (seats[i]->isVisible()) seats[i]->update(); },
-                     Qt::QueuedConnection);
     window.show();
     window.requestActivate();
 #ifdef _WIN32
@@ -1028,6 +1029,20 @@ int main(int argc, char** argv) {
 #else
     void* winHandle = nullptr;
 #endif
+    // Render driving honors the fps cap. auto/uncapped (cap <= 0): render at the monitor refresh by
+    // re-requesting a frame after each present (vsync-paced). custom cap (N): a timer requests frames at N
+    // fps. The 16ms logic timer no longer drives rendering -- it only updates geometry/state -- so the cap
+    // is the sole compositor frame-rate control. (Engine seats are capped separately by the DLL via SS_FPS.)
+    auto requestSeatRepaint = [&]() { for (int i = 0; i < 4; ++i) if (seats[i]->isVisible()) seats[i]->update(); };
+    QTimer renderTimer;
+    if (g_fpsCap > 0) {
+        int iv = 1000 / g_fpsCap; if (iv < 1) iv = 1;
+        QObject::connect(&renderTimer, &QTimer::timeout, &window, requestSeatRepaint);
+        renderTimer.start(iv);
+    } else {
+        QObject::connect(&window, &QQuickWindow::frameSwapped, &window, requestSeatRepaint, Qt::QueuedConnection);
+    }
+
     bool lookPrimed = false;   // skip the first cursor delta after (re)gaining capture (avoids a jump)
     bool wasActive  = true;    // track focus transitions to release seat-0 keys on focus loss
     uint32_t fpsT0  = SDL_GetTicks();   // window-title fps counter window start
@@ -1123,9 +1138,8 @@ int main(int argc, char** argv) {
             seats[i]->setVisible(show[i]);
             if (show[i]) {
                 seats[i]->setPosition(QPointF(paneFor[i].x, paneFor[i].y));
-                seats[i]->setSize(QSizeF(paneFor[i].w, paneFor[i].h));
-                seats[i]->update();
-            }
+                seats[i]->setSize(QSizeF(paneFor[i].w, paneFor[i].h));   // geometry change marks it dirty;
+            }                                                            // the render pacer drives per-frame repaints
         }
         UpdateOverlay(W, H, joinArea, joinSeatPane, disconnects);
 
@@ -1155,6 +1169,7 @@ int main(int argc, char** argv) {
     for (int p = 0; p < 4; ++p) if (g_pads[p]) SDL_GameControllerClose(g_pads[p]);
     SDL_Quit();
 #ifdef _WIN32
+    timeEndPeriod(1);
     WSACleanup();
 #endif
     return rc;
